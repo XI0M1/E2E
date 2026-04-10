@@ -1,0 +1,49 @@
+# 数据库参数自动调优系统依赖
+
+# 数据库和连接
+psycopg2-binary>=2.9.0      # PostgreSQL Python驱动
+
+# 数据处理和科学计算
+numpy>=1.21.0               # 数值计算库
+pandas>=1.3.0               # 数据处理
+scipy>=1.7.0                # 科学计算
+
+# 优化框架
+ConfigSpace>=0.6.0          # 配置空间定义
+smac>=1.4.0                 # SMAC优化器
+
+# 设计空间
+pyDOE>=0.3.9                # Latin Hypercube Sampling
+
+# 优化相关
+pySOT>=1.0.0                # Surrogate Optimization Toolbox
+poap>=0.1.34                # Parallel Object-Oriented Adaptive Partitioning
+
+# 数据格式
+jsonlines>=3.0.0            # JSONL格式支持
+cython>=0.29.0              # Cython编译
+
+# 大模型相关（代理模型训练）
+transformers>=4.30.0        # Hugging Face Transformers库
+torch>=2.0.0                # PyTorch深度学习框架
+peft>=0.4.0                 # 参数高效微调库
+accelerate>=0.20.0          # Hugging Face加速库
+
+# 日志和监控
+tqdm>=4.65.0                # 进度条
+
+# 开发工具（可选）
+ipython>=8.0.0              # IPython交互环境
+jupyter>=1.0.0              # Jupyter Notebook
+matplotlib>=3.5.0           # 绘图库
+seaborn>=0.12.0             # 统计可视化
+
+# 注意：
+# 1. torch 需要根据CUDA版本选择：
+#    - CPU版本：pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+#    - CUDA 11.8: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#    - CUDA 12.1: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# 2. 大模型训练需要GPU支持（推荐 NVIDIA GPU with 8GB+ 显存）
+#
+# 3. psycopg2-binary 可能需要系统库支持，如遇问题可使用 psycopg2 并手动安装PostgreSQL开发包
