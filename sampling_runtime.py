@@ -21,7 +21,9 @@ class SamplingRunRecorder:
         self.metadata_path = metadata_path
         self.resume = resume
         self.completed_keys: Set[str] = set()
-        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        directory = os.path.dirname(metadata_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         if resume and os.path.exists(metadata_path):
             self._load_existing()
 
@@ -55,4 +57,3 @@ class SamplingRunRecorder:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         if record.get("status") == "success" and record.get("sample_key"):
             self.completed_keys.add(record["sample_key"])
-

@@ -8,13 +8,13 @@
 import os
 import json
 import logging
+from typing import Any, Dict, Optional
 from datetime import datetime
 from tuner import tuner
-from Database import Database
 import utils
 
 
-def tune(workload, args):
+def tune(workload: str, host_or_args: Any, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     执行数据库参数调优的主控制函数
     
@@ -36,6 +36,12 @@ def tune(workload, args):
     
     # 1. 配置日志系统
     # 为每个工作负载创建独立的日志文件，便于追踪调优过程
+    if args is None:
+        args = host_or_args
+    else:
+        if 'ssh_config' in args:
+            args['ssh_config']['host'] = host_or_args
+
     log_dir = args['tuning_config'].get('log_dir', './logs')
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
@@ -49,28 +55,24 @@ def tune(workload, args):
     logger.info(f"调优方法: {args['tuning_config'].get('tuning_method', 'SMAC')}")
     
     try:
-        # 2. 初始化数据库连接
-        logger.info("正在连接数据库...")
-        db = Database(args)
-        logger.info("✓ 数据库连接成功")
-        
-        # 3. 初始化调优器
+        # 2. 初始化调优器
         logger.info("正在初始化调优器...")
-        tuning_engine = tuner(args, db, logger)
+        tuning_engine = tuner(args)
         logger.info("✓ 调优器初始化成功")
         
-        # 4. 执行调优
+        # 3. 执行调优
         logger.info("开始执行参数优化...")
-        tuning_engine.tune()
+        best_tps = tuning_engine.tune()
         logger.info("✓ 参数优化完成")
         
-        # 5. 保存调优结果
+        # 4. 保存调优结果
         result_data = {
             'workload': workload,
             'timestamp': timestamp,
             'status': 'completed',
             'tuning_method': args['tuning_config'].get('tuning_method', 'SMAC'),
-            'warmup_method': args['tuning_config'].get('warmup_method', 'default')
+            'warmup_method': args['tuning_config'].get('warmup_method', 'default'),
+            'tps': float(best_tps) if best_tps is not None else None,
         }
         
         result_dir = args['tuning_config'].get('result_dir', './results')

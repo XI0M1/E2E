@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from Database import Database
 from parameter_subsystem import ParameterExecutionSubsystem
+from proposal_generators import RandomProposalGenerator
 from sampling_runtime import SamplingRunRecorder
 from stress_testing_tool import stress_testing_tool
 from feature_extractor import extract_workload_features
@@ -158,50 +159,6 @@ def build_phase1_config(
     config['parameter_execution']['rollback_on_failure'] = 'true'
     config['parameter_execution']['session_mode'] = 'always'
     return config
-
-
-def generate_sample_config(knobs_detail, rng, max_knobs=None):
-    """生成一份轻量随机参数配置，尽量保持参数类型正确。"""
-    config = {}
-    items = list(knobs_detail.items())
-    if max_knobs is not None and max_knobs > 0:
-        items = items[:max_knobs]
-
-    for knob_name, knob_detail in items:
-        knob_type = knob_detail.get('type')
-
-        if knob_type == 'integer':
-            min_val = int(knob_detail.get('min', 0))
-            max_val = int(knob_detail.get('max', min_val))
-            if max_val < min_val:
-                min_val, max_val = max_val, min_val
-            config[knob_name] = rng.randint(min_val, max_val) if max_val > min_val else min_val
-
-        elif knob_type == 'float':
-            min_val = float(knob_detail.get('min', 0.0))
-            max_val = float(knob_detail.get('max', min_val))
-            if max_val < min_val:
-                min_val, max_val = max_val, min_val
-            config[knob_name] = rng.uniform(min_val, max_val) if max_val > min_val else min_val
-
-        elif knob_type == 'enum':
-            enum_values = knob_detail.get('enum_values', [])
-            if enum_values:
-                config[knob_name] = rng.choice(enum_values)
-
-    return config
-
-
-def generate_safe_sample_config(knobs_detail, rng, parameter_subsystem, max_attempts=20, max_knobs=None):
-    """Generate a random configuration that passes joint validation."""
-    last_validation = None
-    for _ in range(max_attempts):
-        candidate = generate_sample_config(knobs_detail, rng, max_knobs=max_knobs)
-        validation = parameter_subsystem.validate_config(candidate)
-        last_validation = validation
-        if validation.get('valid'):
-            return validation.get('normalized_config', candidate)
-    return None
 
 
 def build_single_knob_test_value(db, knob_name: str, knob_detail: Dict[str, Any]) -> Optional[Any]:
@@ -516,8 +473,11 @@ def run_offline_sampling(config, workload_files, logger):
     knobs_detail = get_knobs(knob_config_file)
     
     sample_count = 0
-    import random
-    rng = random.Random(42)
+    proposal_generator = RandomProposalGenerator(
+        strategy="uniform",
+        seed=42,
+        logger=logger,
+    )
     
     for workload_path in test_workloads:
         workload_name = os.path.splitext(os.path.basename(workload_path))[0]
@@ -545,6 +505,11 @@ def run_offline_sampling(config, workload_files, logger):
                         'sample_key': baseline_key,
                         'workload_id': workload_name,
                         'sample_kind': 'baseline',
+                        'metadata': {
+                            'generator': 'baseline',
+                            'status': 'success',
+                            'metric_source': {'score': 'tps'},
+                        },
                         'feature_extraction_status': 'pending',
                     },
                 )
@@ -556,6 +521,11 @@ def run_offline_sampling(config, workload_files, logger):
                     'sample_kind': 'baseline',
                     'parameter_config': baseline_config,
                     'score': performance,
+                    'metadata': {
+                        'generator': 'baseline',
+                        'status': 'success',
+                        'metric_source': {'score': 'tps'},
+                    },
                     'feature_extraction_status': 'pending',
                     'safety_validation_result': parameter_subsystem.validate_config(baseline_config),
                 })
@@ -578,11 +548,13 @@ def run_offline_sampling(config, workload_files, logger):
         for i in range(samples_per_workload):
             try:
                 # 生成随机参数配置
-                random_config = generate_safe_sample_config(
-                    knobs_detail,
-                    rng,
-                    parameter_subsystem,
+                generated = proposal_generator.generate(
+                    workload_features={},
+                    history=[],
+                    constraints=knobs_detail,
+                    n=1,
                 )
+                random_config = generated[0] if generated else None
                 if not random_config:
                     logger.warning("      未能生成通过联合约束校验的随机配置，跳过本轮采样")
                     recorder.record({
@@ -591,6 +563,11 @@ def run_offline_sampling(config, workload_files, logger):
                         'workload_id': workload_name,
                         'sample_kind': 'random',
                         'sample_index': i,
+                        'metadata': {
+                            'generator': proposal_generator.name,
+                            'status': 'skipped',
+                            'metric_source': {'score': 'tps'},
+                        },
                         'reason': 'safety_validation_rejected',
                         'feature_extraction_status': 'pending',
                     })
@@ -611,6 +588,11 @@ def run_offline_sampling(config, workload_files, logger):
                         'workload_id': workload_name,
                         'sample_kind': 'random',
                         'sample_index': i,
+                        'metadata': {
+                            'generator': proposal_generator.name,
+                            'status': 'success',
+                            'metric_source': {'score': 'tps'},
+                        },
                         'feature_extraction_status': 'pending',
                         'safety_validation_result': safety_validation_result,
                     },
@@ -625,6 +607,11 @@ def run_offline_sampling(config, workload_files, logger):
                     'sample_index': i,
                     'parameter_config': random_config,
                     'score': performance,
+                    'metadata': {
+                        'generator': proposal_generator.name,
+                        'status': 'success',
+                        'metric_source': {'score': 'tps'},
+                    },
                     'feature_extraction_status': 'pending',
                     'safety_validation_result': safety_validation_result,
                 })
@@ -637,6 +624,11 @@ def run_offline_sampling(config, workload_files, logger):
                     'workload_id': workload_name,
                     'sample_kind': 'random',
                     'sample_index': i,
+                    'metadata': {
+                        'generator': proposal_generator.name,
+                        'status': 'failed',
+                        'metric_source': {'score': 'tps'},
+                    },
                     'score': 0.0,
                     'feature_extraction_status': 'pending',
                     'error': str(e),
