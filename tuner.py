@@ -425,7 +425,7 @@ class tuner:
         # 可选：训练后验安全模型（需要大量历史数据）
         # self.post_safe.train(data_path='./')
 
-    def tune(self):
+    def tune(self) -> float | None:
         """
         调优主入口
         
@@ -438,12 +438,12 @@ class tuner:
             无（结果保存到文件）
         """
         if self.method == 'SMAC':
-            self.SMAC()
+            return self.SMAC()
         # 可以在这里添加其他优化方法
         # elif self.method == 'BOHB':
         #     self.BOHB()
 
-    def SMAC(self):
+    def SMAC(self) -> float:
         """
         SMAC (Sequential Model-Based Algorithm Configuration) 优化器
         
@@ -474,6 +474,7 @@ class tuner:
         print("开始SMAC优化过程...")
         self.logger.info(f"===== SMAC优化开始 =====")
         self.logger.info(f"样本数: {self.sampling_number}, 迭代数: {self.iteration}")
+        best_tps = 0.0
         
         # ==================== 第一步：定义性能目标函数 ====================
         # 这个函数会被SMAC反复调用来评估候选配置的性能
@@ -489,10 +490,12 @@ class tuner:
                 float: 负的性能评分（SMAC最小化此值等价于最大化性能）
             """
             # 测试这个配置
+            nonlocal best_tps
             y = self.stt.test_config(point)
             
             # SMAC最小化目标，所以如果我们要最大化TPS，返回-TPS
             result = -y
+            best_tps = max(best_tps, float(y))
             
             self.logger.debug(f"评估配置，性能={y:.2f}")
             return result
@@ -538,9 +541,6 @@ class tuner:
         # （当前代码中为空，可扩展为加载相似工作负载的数据）
         if self.warmup == 'workload_map' or self.warmup == 'rgpe':
             # 可以在这里添加历史数据以加速优化
-            # for line in self.rh_data:
-            #     config = cs.get_default_configuration()
-            #     # 导入配置数据...
             pass
         
         # 生成输出目录名
@@ -623,83 +623,7 @@ class tuner:
         
         self.logger.info(f"===== SMAC优化完成 =====")
         print(f"优化结果已保存到: {result_file}")
-
-        def get_neg_result(point):
-            y = self.stt.test_config(point)
-            result = -y
-            # evaluation_results.append([point, result])
-            # print(result)
-            return result
-        
-        cs = ConfigurationSpace()
-        print('begin')
-        for name in self.knobs_detail.keys():
-            detail = self.knobs_detail[name]
-            if detail['type'] == 'integer':
-                if detail['max'] == detail['min']: detail['max'] += 1
-                knob = UniformIntegerHyperparameter(name, detail['min'],\
-                                                     detail['max'], default_value=detail['default'])
-            elif detail['type'] == 'float':
-                knob = UniformFloatHyperparameter(name, detail['min'],\
-                                                     detail['max'], default_value=detail['default'])
-            cs.add_hyperparameter(knob)
-
-        runhistory = RunHistory()
-        if self.warmup == 'workload_map' or self.warmup == 'rgpe':
-            for line in self.rh_data:
-                continue
-                # empty_config = cs.sample_configuration()
-                # config = empty_config.import_values(line['config'])
-                # config = cs.get_default_configuration().new_configuration(line['config'])
-                # runhistory.add(config=config, cost=line['tps'], time=line['tps']*10)
-        
-        save_workload = self.wl_id.split('SuperWG/res/gpt_workloads/')[1]
-        save_workload = save_workload.split('.wg')[0]
-        if self.warmup == 'rgpe':
-            matched_workload = self.matched_wl.split('SuperWG/res/gpt_workloads/')[1]
-            matched_workload = matched_workload.split('.wg')[0]
-            scenario = Scenario({"run_obj": "quality",   # {runtime,quality}
-                            "runcount-limit": 75,   # max. number of function evaluations; for this example set to a low number
-                            "cs": cs,               # configuration space
-                            "deterministic": "true",
-                            "output_dir": f"./{matched_workload}_smac_output",  
-                            "save_model": "true",
-                            "local_results_path": f"./models/{save_workload}"
-                            })
-        else:
-            scenario = Scenario({"run_obj": "quality",   # {runtime,quality}
-                            "runcount-limit": 75,   # max. number of function evaluations; for this example set to a low number
-                            "cs": cs,               # configuration space
-                            "deterministic": "true",
-                            "output_dir": f"./{save_workload}_smac_output",  
-                            "save_model": "true",
-                            "local_results_path": f"./models/{save_workload}"
-                            })
-        
-        smac = SMAC4HPO(scenario=scenario, rng=np.random.RandomState(42),tae_runner=get_neg_result, runhistory=runhistory)
-        incumbent = smac.optimize()  
-        print('finish')
-        print(type(incumbent))
-        print(incumbent)
-        # print(get_neg_result(incumbent))
-        runhistory = smac.runhistory
-        print(runhistory.data)
-
-        def runhistory_to_json(runhistory):
-            data_to_save = {}
-            for run_key in runhistory.data.keys():
-                config_id, instance_id, seed, budget = run_key
-                run_value = runhistory.data[run_key]
-                data_to_save[str(run_key)] = {
-                    "cost": run_value.cost,
-                    "time": run_value.time,
-                    "status": run_value.status.name,
-                    "additional_info": run_value.additional_info
-                }
-            return json.dumps(data_to_save, indent=4)
-
-        with open(f"smac_his/{save_workload}_{self.warmup}.json", "w") as f:
-            f.write(runhistory_to_json(runhistory))
+        return best_tps
 
     # def RGPE(self):
     #     matched_workload = self.matched_wl.split('SuperWG/res/gpt_workloads/')[1]

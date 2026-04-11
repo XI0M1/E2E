@@ -150,7 +150,6 @@ class stress_testing_tool:
                 'apply_static': apply_static,
                 'restart_performed': config_stats.get('static', 0) > 0 and restart_if_static,
                 'config_stats': config_stats,
-                'sample_metadata': sample_metadata or {},
             }
             self._save_sample_enhanced(sample_data)
             
@@ -469,7 +468,6 @@ class stress_testing_tool:
             apply_static = sample_data.get('apply_static', False)
             restart_performed = sample_data.get('restart_performed', False)
             config_stats = sample_data.get('config_stats', {})
-            sample_metadata = sample_data.get('sample_metadata', {})
             
             output_data = {
                 'config': config,
@@ -479,7 +477,6 @@ class stress_testing_tool:
                 'apply_static': apply_static,
                 'restart_performed': restart_performed,
                 'config_stats': config_stats,
-                'sample_metadata': sample_metadata,
                 'workload': self.benchmark_config.get('workload_path', 'unknown'),
                 'workload_file': os.path.basename(self.workload_file),
                 'y': -performance,  # 用于最小化优化
