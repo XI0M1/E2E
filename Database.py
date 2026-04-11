@@ -93,6 +93,8 @@ class Database:
         fetchall() and raising `no results to fetch`.
         """
         try:
+            if self.cursor is None:
+                raise RuntimeError("Database session is not connected")
             self.cursor.execute(query)
             if self.cursor.description is None:
                 return []
@@ -113,10 +115,20 @@ class Database:
     def execute_command(self, query: str) -> None:
         """Execute a SQL statement that does not need a fetched result set."""
         try:
+            if self.cursor is None:
+                raise RuntimeError("Database session is not connected")
             self.cursor.execute(query)
         except Exception as exc:
             self.logger.error("Command failed: %s", exc)
             raise
+
+    def normalize_parameter_value(
+        self,
+        metadata: Dict[str, Any],
+        value: Any,
+    ) -> Tuple[Any, bool]:
+        """Public wrapper used by the parameter validation subsystem."""
+        return self._normalize_parameter_value(metadata, value)
 
     def _escape_literal(self, value: str) -> str:
         return value.replace("'", "''")
@@ -255,6 +267,11 @@ class Database:
             if not ok:
                 report["errors"].append(f"{name}:{detail}")
 
+        if self.cursor is None:
+            mark("connectivity", False, "Database session is not connected")
+            report["healthy"] = False
+            return report
+
         try:
             self.execute_query("SELECT 1")
             mark("connectivity", True, "SELECT 1 succeeded")
@@ -392,6 +409,7 @@ class Database:
             "health_ok": None,
             "health_report": None,
             "rollback": None,
+            "requires_manual_recovery": False,
             "details": [],
         }
 
@@ -463,6 +481,10 @@ class Database:
             stats["restarted"] = self.restart()
             if not stats["restarted"]:
                 self.logger.error("Restart-required parameters were written but PostgreSQL restart failed")
+                stats["health_ok"] = False
+                stats["details"].append(("restart", "restart_failed"))
+                stats["requires_manual_recovery"] = True
+                return stats
 
         if verify:
             params_to_verify: List[Tuple[str, Any]] = []

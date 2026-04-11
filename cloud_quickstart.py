@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from Database import Database
 from parameter_subsystem import ParameterExecutionSubsystem
+from sampling_runtime import SamplingRunRecorder
 from stress_testing_tool import stress_testing_tool
 from feature_extractor import extract_workload_features
 from training_data_builder import build_training_data
@@ -123,7 +124,15 @@ def discover_workloads(config, logger):
     return workload_files
 
 
-def build_phase1_config(base_config, workload_dir, database_name, sample_prefix):
+def build_phase1_config(
+    base_config,
+    workload_dir,
+    database_name,
+    sample_prefix,
+    workload_limit=3,
+    samples_per_workload=5,
+    resume_sampling=False,
+):
     """为 Phase 1 构建更稳定的运行配置。"""
     config = json.loads(json.dumps(base_config))
     config.setdefault('database_config', {})
@@ -138,6 +147,9 @@ def build_phase1_config(base_config, workload_dir, database_name, sample_prefix)
     config['benchmark_config']['timeout'] = config['benchmark_config'].get('timeout', '300')
     config['benchmark_config']['fetch_result_rows'] = 'false'
     config['benchmark_config']['fresh_session_per_test'] = 'true'
+    config['benchmark_config']['workload_limit'] = str(workload_limit)
+    config['benchmark_config']['samples_per_workload'] = str(samples_per_workload)
+    config['benchmark_config']['resume_sampling'] = 'true' if resume_sampling else 'false'
     config['parameter_execution']['apply_reload'] = 'true'
     config['parameter_execution']['apply_restart'] = 'true'
     config['parameter_execution']['reload_if_needed'] = 'true'
@@ -178,6 +190,18 @@ def generate_sample_config(knobs_detail, rng, max_knobs=None):
                 config[knob_name] = rng.choice(enum_values)
 
     return config
+
+
+def generate_safe_sample_config(knobs_detail, rng, parameter_subsystem, max_attempts=20, max_knobs=None):
+    """Generate a random configuration that passes joint validation."""
+    last_validation = None
+    for _ in range(max_attempts):
+        candidate = generate_sample_config(knobs_detail, rng, max_knobs=max_knobs)
+        validation = parameter_subsystem.validate_config(candidate)
+        last_validation = validation
+        if validation.get('valid'):
+            return validation.get('normalized_config', candidate)
+    return None
 
 
 def build_single_knob_test_value(db, knob_name: str, knob_detail: Dict[str, Any]) -> Optional[Any]:
@@ -453,8 +477,12 @@ def run_offline_sampling(config, workload_files, logger):
     """
     logger.info("\n[步骤 2/6] 执行离线采样 (Phase 1)...\n")
     
-    # 只处理前3个workload进行测试
-    test_workloads = workload_files[:3]
+    workload_limit = int(config['benchmark_config'].get('workload_limit', 3))
+    samples_per_workload = int(config['benchmark_config'].get('samples_per_workload', 5))
+    resume_enabled = str(config['benchmark_config'].get('resume_sampling', 'false')).lower() == 'true'
+
+    # 只处理前 N 个 workload 进行测试
+    test_workloads = workload_files[:workload_limit]
     logger.info(f"本次将采样 {len(test_workloads)} 个workload（测试）：")
     for wf in test_workloads:
         logger.info(f"  - {os.path.basename(wf)}")
@@ -466,9 +494,13 @@ def run_offline_sampling(config, workload_files, logger):
     sample_dir = './offline_sample'
     os.makedirs(sample_dir, exist_ok=True)
     sample_file = os.path.join(sample_dir, 'offline_sample')
-    reset_output_file(sample_file + '.jsonl')
-    
+    metadata_file = os.path.join(sample_dir, 'sampling_metadata.jsonl')
+    if not resume_enabled:
+        reset_output_file(sample_file + '.jsonl')
+        reset_output_file(metadata_file)
+
     parameter_subsystem = ParameterExecutionSubsystem.from_config(config, db, logger)
+    recorder = SamplingRunRecorder(metadata_file, resume=resume_enabled)
     tool = stress_testing_tool(
         config,
         db,
@@ -503,26 +535,112 @@ def run_offline_sampling(config, workload_files, logger):
 
         try:
             logger.info("  [baseline] 测试默认参数配置...")
-            performance = tool.test_config(baseline_config)
-            sample_count += 1
-            logger.info(f"      性能评分: {performance:.4f}")
+            baseline_key = recorder.build_sample_key(workload_name, 'baseline', baseline_config)
+            if recorder.should_skip(baseline_key):
+                logger.info("      baseline 已完成，resume 模式下跳过")
+            else:
+                performance = tool.test_config(
+                    baseline_config,
+                    sample_metadata={
+                        'sample_key': baseline_key,
+                        'workload_id': workload_name,
+                        'sample_kind': 'baseline',
+                        'feature_extraction_status': 'pending',
+                    },
+                )
+                sample_count += 1
+                recorder.record({
+                    'sample_key': baseline_key,
+                    'status': 'success',
+                    'workload_id': workload_name,
+                    'sample_kind': 'baseline',
+                    'parameter_config': baseline_config,
+                    'score': performance,
+                    'feature_extraction_status': 'pending',
+                    'safety_validation_result': parameter_subsystem.validate_config(baseline_config),
+                })
+                logger.info(f"      性能评分: {performance:.4f}")
         except Exception as e:
             logger.warning(f"      baseline 失败: {e}")
+            recorder.record({
+                'sample_key': recorder.build_sample_key(workload_name, 'baseline', baseline_config),
+                'status': 'failed',
+                'workload_id': workload_name,
+                'sample_kind': 'baseline',
+                'parameter_config': baseline_config,
+                'score': 0.0,
+                'feature_extraction_status': 'pending',
+                'error': str(e),
+                'safety_validation_result': parameter_subsystem.validate_config(baseline_config),
+            })
 
-        # 执行5次简单的参数采样
-        for i in range(5):
+        # 执行 N 次简单的参数采样
+        for i in range(samples_per_workload):
             try:
                 # 生成随机参数配置
-                random_config = generate_sample_config(knobs_detail, rng)
+                random_config = generate_safe_sample_config(
+                    knobs_detail,
+                    rng,
+                    parameter_subsystem,
+                )
+                if not random_config:
+                    logger.warning("      未能生成通过联合约束校验的随机配置，跳过本轮采样")
+                    recorder.record({
+                        'sample_key': f"{workload_name}:random:{i}",
+                        'status': 'skipped',
+                        'workload_id': workload_name,
+                        'sample_kind': 'random',
+                        'sample_index': i,
+                        'reason': 'safety_validation_rejected',
+                        'feature_extraction_status': 'pending',
+                    })
+                    continue
                 
                 # 测试这个配置
-                logger.info(f"  [{i+1}/5] 测试参数配置...")
-                performance = tool.test_config(random_config)
+                logger.info(f"  [{i+1}/{samples_per_workload}] 测试参数配置...")
+                sample_key = recorder.build_sample_key(workload_name, f'random-{i}', random_config)
+                if recorder.should_skip(sample_key):
+                    logger.info("      样本已完成，resume 模式下跳过")
+                    continue
+
+                safety_validation_result = parameter_subsystem.validate_config(random_config)
+                performance = tool.test_config(
+                    random_config,
+                    sample_metadata={
+                        'sample_key': sample_key,
+                        'workload_id': workload_name,
+                        'sample_kind': 'random',
+                        'sample_index': i,
+                        'feature_extraction_status': 'pending',
+                        'safety_validation_result': safety_validation_result,
+                    },
+                )
                 sample_count += 1
                 logger.info(f"      性能评分: {performance:.4f}")
+                recorder.record({
+                    'sample_key': sample_key,
+                    'status': 'success',
+                    'workload_id': workload_name,
+                    'sample_kind': 'random',
+                    'sample_index': i,
+                    'parameter_config': random_config,
+                    'score': performance,
+                    'feature_extraction_status': 'pending',
+                    'safety_validation_result': safety_validation_result,
+                })
                 
             except Exception as e:
                 logger.warning(f"      采样失败: {e}")
+                recorder.record({
+                    'sample_key': f"{workload_name}:random:{i}:failed",
+                    'status': 'failed',
+                    'workload_id': workload_name,
+                    'sample_kind': 'random',
+                    'sample_index': i,
+                    'score': 0.0,
+                    'feature_extraction_status': 'pending',
+                    'error': str(e),
+                })
                 continue
     
     logger.info(f"\n✓ 离线采样完成，生成了 {sample_count} 个样本")
@@ -641,6 +759,12 @@ def main():
                        help='执行小规模静态参数 smoke test（会触发数据库重启）')
     parser.add_argument('--validate-all-knobs', action='store_true',
                        help='对所有参数做一次单项验证，覆盖动态与静态参数路径')
+    parser.add_argument('--resume', action='store_true',
+                       help='恢复已有采样任务，跳过已成功完成的样本')
+    parser.add_argument('--workload-limit', type=int, default=3,
+                       help='本轮最多处理多少个 workload')
+    parser.add_argument('--samples-per-workload', type=int, default=5,
+                       help='每个 workload 额外生成多少个随机样本')
     args = parser.parse_args()
     
     # 设置日志
@@ -656,6 +780,9 @@ def main():
             workload_dir=workload_dir,
             database_name=args.database,
             sample_prefix=os.path.join('offline_sample', 'offline_sample'),
+            workload_limit=args.workload_limit,
+            samples_per_workload=args.samples_per_workload,
+            resume_sampling=args.resume,
         )
         logger.info(f"✓ 配置加载成功")
         

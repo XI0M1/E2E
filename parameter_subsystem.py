@@ -11,6 +11,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from parameter_validation import ParameterConstraintValidator
+
 
 def _parse_bool(value: Any, default: bool) -> bool:
     if value is None:
@@ -66,6 +68,7 @@ class ParameterExecutionSubsystem:
         self.database = database
         self.logger = logger or logging.getLogger("ParameterExecutionSubsystem")
         self.policy = policy or ParameterExecutionPolicy()
+        self.validator = ParameterConstraintValidator(database, self.logger)
 
     @classmethod
     def from_config(cls, config: Dict[str, Any], database, logger=None) -> "ParameterExecutionSubsystem":
@@ -110,6 +113,12 @@ class ParameterExecutionSubsystem:
 
         return plan
 
+    def validate_config(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        return self.validator.validate_payload(config_dict).to_dict()
+
+    def validate_json_config(self, payload_text: str) -> Dict[str, Any]:
+        return self.validator.validate_json_text(payload_text).to_dict()
+
     def _resolve_force_new_session(
         self,
         config_dict: Dict[str, Any],
@@ -130,7 +139,8 @@ class ParameterExecutionSubsystem:
         restart_if_static: Optional[bool] = None,
         force_new_session: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        plan = self.inspect_config(config_dict)
+        validation = self.validator.validate_payload(config_dict)
+        plan = self.inspect_config(validation.normalized_config)
         effective_apply_static = (
             apply_static
             if apply_static is not None
@@ -142,12 +152,50 @@ class ParameterExecutionSubsystem:
             else self.policy.apply_restart
         )
         effective_force_new_session = self._resolve_force_new_session(
-            config_dict,
+            validation.normalized_config,
             force_new_session=force_new_session,
         )
 
+        if not validation.valid:
+            self.logger.error(
+                "Parameter batch rejected by validator: %s",
+                "; ".join(issue.message for issue in validation.issues if issue.severity == "error"),
+            )
+            return {
+                "dynamic": 0,
+                "static": 0,
+                "reload": 0,
+                "skipped": len(validation.normalized_config),
+                "failed": len([issue for issue in validation.issues if issue.severity == "error"]),
+                "clamped": len([issue for issue in validation.issues if issue.rule == "parameter.clamped"]),
+                "verified": 0,
+                "restarted": False,
+                "reloaded": False,
+                "health_ok": False,
+                "health_report": None,
+                "rollback": None,
+                "requires_manual_recovery": False,
+                "details": [
+                    (
+                        issue.parameter or "config",
+                        f"{issue.rule}:{issue.message}",
+                    )
+                    for issue in validation.issues
+                ],
+                "execution_plan": plan,
+                "policy": {
+                    "apply_static": effective_apply_static,
+                    "restart_if_static": effective_restart_if_static,
+                    "force_new_session": effective_force_new_session,
+                    "verify": self.policy.verify,
+                    "health_check": self.policy.health_check,
+                    "rollback_on_failure": self.policy.rollback_on_failure,
+                },
+                "validation": validation.to_dict(),
+            }
+
         self.database.prepare_session_for_config(
-            config_dict,
+            validation.normalized_config,
             force_new_session=effective_force_new_session,
         )
 
@@ -161,7 +209,7 @@ class ParameterExecutionSubsystem:
         )
 
         stats = self.database.apply_config(
-            config_dict,
+            validation.normalized_config,
             apply_static=effective_apply_static,
             restart_if_static=effective_restart_if_static,
             reload_if_needed=self.policy.reload_if_needed,
@@ -170,6 +218,7 @@ class ParameterExecutionSubsystem:
             rollback_on_failure=self.policy.rollback_on_failure,
         )
         stats["execution_plan"] = plan
+        stats["validation"] = validation.to_dict()
         stats["policy"] = {
             "apply_static": effective_apply_static,
             "restart_if_static": effective_restart_if_static,
@@ -179,4 +228,3 @@ class ParameterExecutionSubsystem:
             "rollback_on_failure": self.policy.rollback_on_failure,
         }
         return stats
-
