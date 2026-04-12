@@ -230,7 +230,9 @@ class SMACProposalGenerator(ProposalGenerator):
             deterministic=True,
             n_trials=self.runcount_limit,
             seed=self.seed,
-            output_directory=Path(self.output_dir) / "smac_internal",  # Isolate SMAC-managed files from our JSON state file.
+            # Isolate SMAC-managed files from smac_state.json to prevent overwrite=True
+            # from clearing our JSON state file in future SMAC version changes.
+            output_directory=Path(self.output_dir) / "smac_internal",
             name="smac_proposal_generator",
         )
 
@@ -310,11 +312,8 @@ class SMACProposalGenerator(ProposalGenerator):
         config = record.get("config")
         tps = record.get("tps")
         if not isinstance(config, dict) or tps is None:
-            # Skip malformed records so one bad line does not discard all replayable history.
-            self.logger.warning(
-                "Skipping malformed trial record (index in file unknown): %r",
-                record,
-            )
+            # Skip malformed records so one bad entry does not abort the entire replay.
+            self.logger.warning("Skipping malformed SMAC trial record: %r", record)
             return
 
         validated_config = self.validate_proposal(config, self.knobs_detail)

@@ -618,6 +618,22 @@ class TrainingDataBuilder:
         if not self.load_samples():
             return False
 
+        # Auto-adjust min_samples when available data is less than the configured minimum.
+        if min_samples is None:
+            eligible_count = sum(
+                1 for s in self.samples
+                if float(s.get("tps", 0.0)) >= self.builder_config.min_tps
+            )
+            if eligible_count < self.builder_config.min_samples:
+                auto_min = max(10, int(eligible_count * 0.8))
+                logger.info(
+                    "Auto-adjusting min_samples from %d to %d (%d eligible samples available)",
+                    self.builder_config.min_samples,
+                    auto_min,
+                    eligible_count,
+                )
+                min_samples = auto_min
+
         selected_samples = self.select_high_quality_samples(min_samples, max_samples)
         training_samples = self.build_training_samples(selected_samples)
         if not self.save_training_data(training_samples):
