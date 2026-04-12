@@ -90,9 +90,10 @@ class SMACProposalGenerator(ProposalGenerator):
             trial_info = self.smac.ask()
             proposal = self._configuration_to_dict(trial_info.config)
             validated = self.validate_proposal(proposal, constraints)
-            normalized_info = self._normalize_trial_info(trial_info, validated)
             proposal_key = self._history_key(validated)
-            self._pending_trials.setdefault(proposal_key, []).append(normalized_info)
+            # Keep the original TrialInfo returned by ask() so tell() updates
+            # the same pending trial instead of creating a second runhistory row.
+            self._pending_trials.setdefault(proposal_key, []).append(trial_info)
             proposals.append(validated)
 
         self.runhistory = self.smac.runhistory
@@ -229,7 +230,7 @@ class SMACProposalGenerator(ProposalGenerator):
             deterministic=True,
             n_trials=self.runcount_limit,
             seed=self.seed,
-            output_directory=Path(self.output_dir),
+            output_directory=Path(self.output_dir) / "smac_internal",  # Isolate SMAC-managed files from our JSON state file.
             name="smac_proposal_generator",
         )
 
@@ -257,18 +258,6 @@ class SMACProposalGenerator(ProposalGenerator):
             if not isinstance(config, dict) or tps is None:
                 continue
             self.tell(config, float(tps))
-
-    def _normalize_trial_info(
-        self,
-        trial_info: TrialInfo,
-        validated_config: ConfigDict,
-    ) -> TrialInfo:
-        return TrialInfo(
-            config=self._dict_to_configuration(validated_config),
-            instance=trial_info.instance,
-            seed=trial_info.seed,
-            budget=trial_info.budget,
-        )
 
     def _pop_pending_trial(self, config_key: str) -> TrialInfo | None:
         queue = self._pending_trials.get(config_key)
@@ -321,7 +310,12 @@ class SMACProposalGenerator(ProposalGenerator):
         config = record.get("config")
         tps = record.get("tps")
         if not isinstance(config, dict) or tps is None:
-            raise ValueError("Invalid SMAC trial record")
+            # Skip malformed records so one bad line does not discard all replayable history.
+            self.logger.warning(
+                "Skipping malformed trial record (index in file unknown): %r",
+                record,
+            )
+            return
 
         validated_config = self.validate_proposal(config, self.knobs_detail)
         trial_info = TrialInfo(

@@ -12,10 +12,6 @@ scipy>=1.7.0
 ConfigSpace>=1.0.0,<2.0
 smac>=2.0.0,<3.0
 
-# Other optimization-related utilities
-pySOT>=1.0.0
-poap>=0.1.34
-
 # Data formats
 jsonlines>=3.0.0
 cython>=0.29.0

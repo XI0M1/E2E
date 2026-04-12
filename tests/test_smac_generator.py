@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 pytest.importorskip("smac")
@@ -135,3 +137,66 @@ def test_load_state_handles_corruption(tmp_path, knobs):
 
     gen = SMACProposalGenerator(knobs, output_dir=str(tmp_path / "s"), seed=42)
     assert gen.load_state(str(corrupt_path)) is False
+
+
+def test_true_resume_same_output_dir(tmp_path, knobs, valid_config):
+    """Validate real resume behavior when a new generator starts in the same output directory."""
+    output_dir = tmp_path / "smac_run"
+    gen1 = SMACProposalGenerator(knobs, output_dir=str(output_dir), seed=42)
+    gen1.tell(valid_config, 100.0)
+    expected_key = gen1._history_key(valid_config)
+    gen1.save_state(gen1.state_path)
+
+    del gen1
+
+    gen2 = SMACProposalGenerator(knobs, output_dir=str(output_dir), seed=42)
+    assert len(gen2.runhistory) >= 1
+    assert expected_key in gen2._history_keys
+
+
+def test_generate_after_direct_tell_without_ask(tmp_path, knobs, valid_config):
+    """Validate SMAC can still generate proposals after direct external feedback without a prior ask."""
+    gen = SMACProposalGenerator(
+        knobs,
+        output_dir=str(tmp_path / "smac_run"),
+        runcount_limit=10,
+        seed=42,
+    )
+    gen.tell(valid_config, 100.0)
+
+    proposals = gen.generate({}, [], knobs, n=1)
+
+    assert proposals
+    assert set(proposals[0].keys()) == set(knobs.keys())
+
+
+def test_ask_then_tell_feedback_loop(tmp_path, knobs):
+    """Validate the primary production path where ask() is followed by tell() using a pending trial."""
+    gen = SMACProposalGenerator(knobs, output_dir=str(tmp_path / "smac_run"), seed=42)
+
+    proposals = gen.generate({}, [], knobs, n=1)
+    config = proposals[0]
+    gen.tell(config, tps=150.0)
+
+    assert len(gen.runhistory) == 1
+    assert len(gen._pending_trials) == 0
+    assert len(gen._trial_records) == 1
+
+
+def test_replay_skips_malformed_record(tmp_path, knobs, valid_config):
+    """Validate malformed trial records are skipped while valid replay history is preserved."""
+    output_dir = tmp_path / "smac_run"
+    gen = SMACProposalGenerator(knobs, output_dir=str(output_dir), seed=42)
+    gen.tell(valid_config, 100.0)
+    gen.save_state(gen.state_path)
+
+    with open(gen.state_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    payload["trial_records"].append({"config": None, "tps": None})
+    with open(gen.state_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+    gen2 = SMACProposalGenerator(knobs, output_dir=str(output_dir), seed=42)
+
+    assert len(gen2.runhistory) >= 1
+    assert len(gen2._trial_records) >= 1
