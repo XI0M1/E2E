@@ -94,6 +94,8 @@ def load_config(cli_args: argparse.Namespace) -> dict[str, Any]:
     config["benchmark_config"]["tool"] = "direct"
 
     sample_prefix = config["tuning_config"].get("offline_sample", "offline_sample/offline_sample")
+    # Store offline samples under a per-database directory so tpch/job runs do not overwrite each other.
+    sample_prefix = os.path.join("offline_sample", cli_args.database, os.path.basename(str(sample_prefix)))
     if cli_args.host not in str(sample_prefix):
         sample_prefix = f"{sample_prefix}_{cli_args.host}"
     config["tuning_config"]["offline_sample"] = sample_prefix
@@ -173,11 +175,13 @@ def main() -> int:
     config = load_config(cli_args)
     knobs_detail = parse_knob_config.get_knobs(config["tuning_config"]["knob_config"])
 
+    # Keep metadata in a per-database directory so each workload family has an isolated resume log.
+    metadata_path = os.path.join("run_metadata", cli_args.database, os.path.basename(cli_args.metadata_path))
     sample_output_path = f"{config['tuning_config']['offline_sample']}.jsonl"
     if not cli_args.resume:
         if not cli_args.dry_run:
             reset_file(sample_output_path)
-        reset_file(cli_args.metadata_path)
+        reset_file(metadata_path)
 
     generator = build_generator(
         strategy=cli_args.strategy,
@@ -186,7 +190,7 @@ def main() -> int:
         n_proposals=cli_args.n_proposals,
         database_name=cli_args.database,
     )
-    recorder = SamplingRunRecorder(cli_args.metadata_path, resume=cli_args.resume)
+    recorder = SamplingRunRecorder(metadata_path, resume=cli_args.resume)
     stt = build_stress_testing_tool(config, logger, dry_run=cli_args.dry_run)
 
     runner = Phase1Runner(
@@ -210,4 +214,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
