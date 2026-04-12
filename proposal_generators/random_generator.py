@@ -8,8 +8,7 @@ import logging
 import random
 from typing import Any, Dict, List
 
-import numpy as np
-from pyDOE import lhs
+from scipy.stats import qmc
 
 from proposal_generators.base import ConfigDict, HistorySamples, KnobConstraints, ProposalGenerator, WorkloadFeatures
 
@@ -90,9 +89,8 @@ class RandomProposalGenerator(ProposalGenerator):
         if dimensions == 0:
             return []
 
-        if self._seed is not None:
-            np.random.seed(self._seed)
-        design = lhs(dimensions, samples=n, criterion="maximin")
+        sampler = qmc.LatinHypercube(d=dimensions, seed=self._seed)
+        design = sampler.random(n=n)
 
         proposals: List[ConfigDict] = []
         for row in design:
@@ -109,4 +107,3 @@ class RandomProposalGenerator(ProposalGenerator):
             proposals.append(self.validate_proposal(proposal, constraints))
 
         return proposals
-

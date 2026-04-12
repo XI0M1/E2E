@@ -10,7 +10,6 @@ import json
 import logging
 from typing import Any, Dict, Optional
 from datetime import datetime
-from tuner import tuner
 import utils
 
 
@@ -41,6 +40,8 @@ def tune(workload: str, host_or_args: Any, args: Optional[Dict[str, Any]] = None
     else:
         if 'ssh_config' in args:
             args['ssh_config']['host'] = host_or_args
+
+    from tuner import tuner
 
     log_dir = args['tuning_config'].get('log_dir', './logs')
     if not os.path.exists(log_dir):

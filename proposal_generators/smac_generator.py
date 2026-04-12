@@ -289,10 +289,10 @@ class SMACProposalGenerator(ProposalGenerator):
         return Configuration(self.configspace, values=config)
 
     def _configuration_to_dict(self, configuration: Any) -> ConfigDict:
-        if hasattr(configuration, "get_dictionary"):
-            config_dict = dict(configuration.get_dictionary())
-        elif isinstance(configuration, dict):
+        if isinstance(configuration, dict):
             config_dict = dict(configuration)
+        elif hasattr(configuration, "items"):
+            config_dict = dict(configuration.items())
         else:
             try:
                 config_dict = dict(configuration)

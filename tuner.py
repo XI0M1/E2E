@@ -1,17 +1,17 @@
-"""
-调优器模块（Tuner Module）
-功能：核心的数据库参数优化算法实现
+﻿"""
+璋冧紭鍣ㄦā鍧楋紙Tuner Module锛?
+鍔熻兘锛氭牳蹇冪殑鏁版嵁搴撳弬鏁颁紭鍖栫畻娉曞疄鐜?
 
-核心算法：SMAC (Sequential Model-Based Algorithm Configuration)
-- 使用贝叶斯优化来搜索参数配置空间
-- 通过学习代理模型(随机森林)逐步改进配置
-- 在有限的评估次数内找到接近最优的参数
+鏍稿績绠楁硶锛歋MAC (Sequential Model-Based Algorithm Configuration)
+- 浣跨敤璐濆彾鏂紭鍖栨潵鎼滅储鍙傛暟閰嶇疆绌洪棿
+- 閫氳繃瀛︿範浠ｇ悊妯″瀷(闅忔満妫灄)閫愭鏀硅繘閰嶇疆
+- 鍦ㄦ湁闄愮殑璇勪及娆℃暟鍐呮壘鍒版帴杩戞渶浼樼殑鍙傛暟
 
-关键特性：
-1. 工作负载映射：找到相似工作负载以重用历史数据
-2. 预热策略：支持多种初始化方式（ours, pilot, workload_map等）
-3. 安全约束：确保生成的配置在有效范围内
-4. 实时采样：边优化边保存数据用于代理模型训练
+鍏抽敭鐗规€э細
+1. 宸ヤ綔璐熻浇鏄犲皠锛氭壘鍒扮浉浼煎伐浣滆礋杞戒互閲嶇敤鍘嗗彶鏁版嵁
+2. 棰勭儹绛栫暐锛氭敮鎸佸绉嶅垵濮嬪寲鏂瑰紡锛坥urs, pilot, workload_map绛夛級
+3. 瀹夊叏绾︽潫锛氱‘淇濈敓鎴愮殑閰嶇疆鍦ㄦ湁鏁堣寖鍥村唴
+4. 瀹炴椂閲囨牱锛氳竟浼樺寲杈逛繚瀛樻暟鎹敤浜庝唬鐞嗘ā鍨嬭缁?
 """
 
 import os
@@ -21,10 +21,7 @@ import sys
 import json
 import copy
 
-# 超采样和实验设计库
-from pyDOE import lhs
-
-# 本地模块导入
+# 鏈湴妯″潡瀵煎叆
 from knob_config import parse_knob_config
 import utils
 import numpy as np
@@ -32,65 +29,60 @@ import pandas as pd
 import jsonlines
 import random
 
-# 数据库和工具模块
+# 鏁版嵁搴撳拰宸ュ叿妯″潡
 from Database import Database
 from Vectorlib import VectorLibrary
 from stress_testing_tool import stress_testing_tool
 from safe.subspace_adaptation import Safe
+from proposal_generators.smac_generator import SMACProposalGenerator
 
-# SMAC优化框架相关导入
+# SMAC浼樺寲妗嗘灦鐩稿叧瀵煎叆
 from poap.controller import BasicWorkerThread, ThreadController
 from pySOT.experimental_design import LatinHypercube
 from pySOT import strategy, surrogate
-from smac.configspace import ConfigurationSpace
-from smac.runhistory.runhistory import RunHistory
-from smac.facade.smac_hpo_facade import SMAC4HPO
-from smac.scenario.scenario import Scenario
-from ConfigSpace.hyperparameters import CategoricalHyperparameter, \
-    UniformFloatHyperparameter, UniformIntegerHyperparameter
 
 
-# ==================== 常数定义 ====================
+# ==================== 甯告暟瀹氫箟 ====================
 
-# TPC-H工作负载的默认参数配置
-# 这是一个参考配置，用于pilot预热方法：基于这个配置添加噪声生成初始点
+# TPC-H宸ヤ綔璐熻浇鐨勯粯璁ゅ弬鏁伴厤缃?
+# 杩欐槸涓€涓弬鑰冮厤缃紝鐢ㄤ簬pilot棰勭儹鏂规硶锛氬熀浜庤繖涓厤缃坊鍔犲櫔澹扮敓鎴愬垵濮嬬偣
 tpch_origin = {"max_wal_senders": 21, "autovacuum_max_workers": 126, "max_connections": 860, "wal_buffers": 86880, "shared_buffers": 1114632, "autovacuum_analyze_scale_factor": 78, "autovacuum_analyze_threshold": 1202647040, "autovacuum_naptime": 101527, "autovacuum_vacuum_cost_delay": 45, "autovacuum_vacuum_cost_limit": 1114, "autovacuum_vacuum_scale_factor": 31, "autovacuum_vacuum_threshold": 1280907392, "backend_flush_after": 172, "bgwriter_delay": 5313, "bgwriter_flush_after": 217, "bgwriter_lru_maxpages": 47, "bgwriter_lru_multiplier": 4, "checkpoint_completion_target": 1, "checkpoint_flush_after": 44, "checkpoint_timeout": 758, "commit_delay": 22825, "commit_siblings": 130, "cursor_tuple_fraction": 1, "deadlock_timeout": 885378880, "default_statistics_target": 5304, "effective_cache_size": 1581112576, "effective_io_concurrency": 556, "from_collapse_limit": 407846592, "geqo_effort": 3, "geqo_generations": 1279335040, "geqo_pool_size": 838207872, "geqo_seed": 0, "geqo_threshold": 1336191360, "join_collapse_limit": 1755487872, "maintenance_work_mem": 1634907776, "temp_buffers": 704544576, "temp_file_limit": -1, "vacuum_cost_delay": 46, "vacuum_cost_limit": 5084, "vacuum_cost_page_dirty": 6633, "vacuum_cost_page_hit": 6940, "vacuum_cost_page_miss": 9381, "wal_writer_delay": 4773, "work_mem": 716290752}
 
 
 def add_noise(knobs_detail, origin_config, range):
     """
-    向参数配置添加随机噪声
+    鍚戝弬鏁伴厤缃坊鍔犻殢鏈哄櫔澹?
     
-    用途：pilot预热策略使用此函数基于已知的好配置添加扰动以生成多样化的初始点
+    鐢ㄩ€旓細pilot棰勭儹绛栫暐浣跨敤姝ゅ嚱鏁板熀浜庡凡鐭ョ殑濂介厤缃坊鍔犳壈鍔ㄤ互鐢熸垚澶氭牱鍖栫殑鍒濆鐐?
     
-    参数：
-        knobs_detail (dict): 参数详细信息，包含每个参数的min/max值
-        origin_config (dict): 原始参数配置
-        range (float): 噪声范围百分比（0-1），例如0.05表示±5%相对于参数范围
+    鍙傛暟锛?
+        knobs_detail (dict): 鍙傛暟璇︾粏淇℃伅锛屽寘鍚瘡涓弬鏁扮殑min/max鍊?
+        origin_config (dict): 鍘熷鍙傛暟閰嶇疆
+        range (float): 鍣０鑼冨洿鐧惧垎姣旓紙0-1锛夛紝渚嬪0.05琛ㄧず卤5%鐩稿浜庡弬鏁拌寖鍥?
     
-    返回：
-        dict: 添加随机噪声后的新配置，所有值都在合法范围内
+    杩斿洖锛?
+        dict: 娣诲姞闅忔満鍣０鍚庣殑鏂伴厤缃紝鎵€鏈夊€奸兘鍦ㄥ悎娉曡寖鍥村唴
     
-    原理：
-        对于每个参数，在其范围的±range%内生成随机扰动，确保最终值不超出边界
-        这样可以在已知的优势点周围进行局部探索，加快收敛
+    鍘熺悊锛?
+        瀵逛簬姣忎釜鍙傛暟锛屽湪鍏惰寖鍥寸殑卤range%鍐呯敓鎴愰殢鏈烘壈鍔紝纭繚鏈€缁堝€间笉瓒呭嚭杈圭晫
+        杩欐牱鍙互鍦ㄥ凡鐭ョ殑浼樺娍鐐瑰懆鍥磋繘琛屽眬閮ㄦ帰绱紝鍔犲揩鏀舵暃
     """
     new_config = copy.deepcopy(origin_config)
     
     for knob in knobs_detail:
         detail = knobs_detail[knob]
-        rb = detail['max']  # 参数上界
-        lb = detail['min']  # 参数下界
+        rb = detail['max']  # 鍙傛暟涓婄晫
+        lb = detail['min']  # 鍙傛暟涓嬬晫
         
-        # 参数范围太小则跳过噪声添加
+        # 鍙傛暟鑼冨洿澶皬鍒欒烦杩囧櫔澹版坊鍔?
         if rb - lb <= 1:
             continue
         
-        # 计算噪声幅度：范围的±range%
+        # 璁＄畻鍣０骞呭害锛氳寖鍥寸殑卤range%
         length = int((rb - lb) * range * 0.5)
         noise = random.randint(-length, length)
         
-        # 应用噪声并严格限制在合法范围内
+        # 搴旂敤鍣０骞朵弗鏍奸檺鍒跺湪鍚堟硶鑼冨洿鍐?
         tmp = origin_config[knob] + noise 
         if tmp < lb: 
             tmp = lb
@@ -106,167 +98,167 @@ def add_noise(knobs_detail, origin_config, range):
 
 class tuner:
     """
-    数据库参数自动调优器核心类
+    鏁版嵁搴撳弬鏁拌嚜鍔ㄨ皟浼樺櫒鏍稿績绫?
     
-    ==== 核心职责 ====
-    1. 初始化调优环境（数据库连接、参数空间、日志）
-    2. 管理参数空间和约束
-    3. 运行参数优化算法（SMAC）
-    4. 记录采样数据和历史结果
-    5. 应用安全约束检查
+    ==== 鏍稿績鑱岃矗 ====
+    1. 鍒濆鍖栬皟浼樼幆澧冿紙鏁版嵁搴撹繛鎺ャ€佸弬鏁扮┖闂淬€佹棩蹇楋級
+    2. 绠＄悊鍙傛暟绌洪棿鍜岀害鏉?
+    3. 杩愯鍙傛暟浼樺寲绠楁硶锛圫MAC锛?
+    4. 璁板綍閲囨牱鏁版嵁鍜屽巻鍙茬粨鏋?
+    5. 搴旂敤瀹夊叏绾︽潫妫€鏌?
     
-    ==== 优化流程 ====
-    初始化 → 参数空间定义 → 默认配置测试 → 工作负载映射 → 
-    SMAC迭代优化 → 最优配置保存
+    ==== 浼樺寲娴佺▼ ====
+    鍒濆鍖?鈫?鍙傛暟绌洪棿瀹氫箟 鈫?榛樿閰嶇疆娴嬭瘯 鈫?宸ヤ綔璐熻浇鏄犲皠 鈫?
+    SMAC杩唬浼樺寲 鈫?鏈€浼橀厤缃繚瀛?
     
-    ==== 属性说明 ====
-    database: PostgreSQL数据库连接对象（若tool='surrogate'则为None）
-    method: 调优方法名称（如'SMAC'）
-    warmup: 预热策略（决定初始点选择）
-        - 'ours': 使用模型预生成的参数
-        - 'pilot': 基于已知优秀配置的扰动
-        - 'workload_map': 使用3个最相似工作负载的历史数据
-        - 'rgpe': 使用10个最相似工作负载的历史数据
-    knobs_detail: 所有参数的定义（包含type, min, max, default等）
-    pre_safe: 前验安全模型（用于约束搜索空间）
-    post_safe: 后验安全模型（用于验证生成的配置）
-    veclib: 工作负载向量库
-    stt: 压力测试工具实例
+    ==== 灞炴€ц鏄?====
+    database: PostgreSQL鏁版嵁搴撹繛鎺ュ璞★紙鑻ool='surrogate'鍒欎负None锛?
+    method: 璋冧紭鏂规硶鍚嶇О锛堝'SMAC'锛?
+    warmup: 棰勭儹绛栫暐锛堝喅瀹氬垵濮嬬偣閫夋嫨锛?
+        - 'ours': 浣跨敤妯″瀷棰勭敓鎴愮殑鍙傛暟
+        - 'pilot': 鍩轰簬宸茬煡浼樼閰嶇疆鐨勬壈鍔?
+        - 'workload_map': 浣跨敤3涓渶鐩镐技宸ヤ綔璐熻浇鐨勫巻鍙叉暟鎹?
+        - 'rgpe': 浣跨敤10涓渶鐩镐技宸ヤ綔璐熻浇鐨勫巻鍙叉暟鎹?
+    knobs_detail: 鎵€鏈夊弬鏁扮殑瀹氫箟锛堝寘鍚玹ype, min, max, default绛夛級
+    pre_safe: 鍓嶉獙瀹夊叏妯″瀷锛堢敤浜庣害鏉熸悳绱㈢┖闂达級
+    post_safe: 鍚庨獙瀹夊叏妯″瀷锛堢敤浜庨獙璇佺敓鎴愮殑閰嶇疆锛?
+    veclib: 宸ヤ綔璐熻浇鍚戦噺搴?
+    stt: 鍘嬪姏娴嬭瘯宸ュ叿瀹炰緥
     """
     
     def __init__(self, config):
         """
-        初始化调优器
+        鍒濆鍖栬皟浼樺櫒
         
-        初始化流程：
-        1. 建立数据库连接（非代理模式）
-        2. 加载配置参数和参数定义
-        3. 初始化压力测试工具
-        4. 加载工作负载特征向量
-        5. 根据预热策略准备初始数据
-        6. 初始化安全约束框架
+        鍒濆鍖栨祦绋嬶細
+        1. 寤虹珛鏁版嵁搴撹繛鎺ワ紙闈炰唬鐞嗘ā寮忥級
+        2. 鍔犺浇閰嶇疆鍙傛暟鍜屽弬鏁板畾涔?
+        3. 鍒濆鍖栧帇鍔涙祴璇曞伐鍏?
+        4. 鍔犺浇宸ヤ綔璐熻浇鐗瑰緛鍚戦噺
+        5. 鏍规嵁棰勭儹绛栫暐鍑嗗鍒濆鏁版嵁
+        6. 鍒濆鍖栧畨鍏ㄧ害鏉熸鏋?
         
-        参数：
-            config (dict): 全局配置字典，包含以下关键sections:
+        鍙傛暟锛?
+            config (dict): 鍏ㄥ眬閰嶇疆瀛楀吀锛屽寘鍚互涓嬪叧閿畇ections:
                 benchmark_config: 
-                    - tool: 'direct'(数据库) 或 'surrogate'(代理模型)
-                    - workload_path: 工作负载文件路径
+                    - tool: 'direct'(鏁版嵁搴? 鎴?'surrogate'(浠ｇ悊妯″瀷)
+                    - workload_path: 宸ヤ綔璐熻浇鏂囦欢璺緞
                 tuning_config:
                     - tuning_method: 'SMAC'
-                    - warmup_method: 预热策略
-                    - sample_num: 初始采样数量
-                    - suggest_num: 优化迭代数
-                    - knob_config: 参数定义文件路径
-                    - log_path: 日志文件路径
-                ssh_config, database_config: 连接信息
+                    - warmup_method: 棰勭儹绛栫暐
+                    - sample_num: 鍒濆閲囨牱鏁伴噺
+                    - suggest_num: 浼樺寲杩唬鏁?
+                    - knob_config: 鍙傛暟瀹氫箟鏂囦欢璺緞
+                    - log_path: 鏃ュ織鏂囦欢璺緞
+                ssh_config, database_config: 杩炴帴淇℃伅
         
-        异常：
-            FileNotFoundError: 参数定义文件或特征文件不存在
-            psycopg2.Error: 数据库连接失败
+        寮傚父锛?
+            FileNotFoundError: 鍙傛暟瀹氫箟鏂囦欢鎴栫壒寰佹枃浠朵笉瀛樺湪
+            psycopg2.Error: 鏁版嵁搴撹繛鎺ュけ璐?
         """
         
-        # ==================== 第一步：初始化数据库 ====================
-        # 决定是否需要真实数据库连接
-        # 使用代理模型时（tool='surrogate'）不需要真实DB，仅进行推理
+        # ==================== 绗竴姝ワ細鍒濆鍖栨暟鎹簱 ====================
+        # 鍐冲畾鏄惁闇€瑕佺湡瀹炴暟鎹簱杩炴帴
+        # 浣跨敤浠ｇ悊妯″瀷鏃讹紙tool='surrogate'锛変笉闇€瑕佺湡瀹濪B锛屼粎杩涜鎺ㄧ悊
         if config['benchmark_config']['tool'] != 'surrogate':
-            # 直接方法：需要连接真实数据库
+            # 鐩存帴鏂规硶锛氶渶瑕佽繛鎺ョ湡瀹炴暟鎹簱
             self.database = Database(config, config['tuning_config']['knob_config'])
-            print(f"已连接到数据库: {config['database_config']['database']}")
+            print(f"宸茶繛鎺ュ埌鏁版嵁搴? {config['database_config']['database']}")
         else: 
-            # 代理模型方法：不需要数据库连接
+            # 浠ｇ悊妯″瀷鏂规硶锛氫笉闇€瑕佹暟鎹簱杩炴帴
             self.database = None
-            print(f"使用代理模型，无需数据库连接")
+            print("使用代理模型，无需数据库连接")
         
-        # ==================== 第二步：加载配置参数 ====================
-        # 调优配置参数
-        self.method = config['tuning_config']['tuning_method']      # 通常为'SMAC'
-        self.warmup = config['tuning_config']['warmup_method']      # 预热策略
-        self.online = config['tuning_config']['online']             # 'true'或'false'
+        # ==================== 绗簩姝ワ細鍔犺浇閰嶇疆鍙傛暟 ====================
+        # 璋冧紭閰嶇疆鍙傛暟
+        self.method = config['tuning_config']['tuning_method']      # 閫氬父涓?SMAC'
+        self.warmup = config['tuning_config']['warmup_method']      # 棰勭儹绛栫暐
+        self.online = config['tuning_config']['online']             # 'true'鎴?false'
         self.online_sample = config['tuning_config']['online_sample']
         self.offline_sample = config['tuning_config']['offline_sample']
         self.finetune_sample = config['tuning_config']['finetune_sample']
         self.inner_metric_sample = config['tuning_config']['inner_metric_sample']
         
-        # 优化参数
-        self.sampling_number = int(config['tuning_config']['sample_num'])  # 初始采样数
-        self.iteration = int(config['tuning_config']['suggest_num'])       # SMAC迭代数
+        # 浼樺寲鍙傛暟
+        self.sampling_number = int(config['tuning_config']['sample_num'])  # 鍒濆閲囨牱鏁?
+        self.iteration = int(config['tuning_config']['suggest_num'])       # SMAC杩唬鏁?
         
-        # ==================== 第三步：加载参数定义 ====================
-        # 从knob_config.json加载所有可优化参数的定义
-        # 包含每个参数的type(integer/float/enum), min, max, default, step等
+        # ==================== 绗笁姝ワ細鍔犺浇鍙傛暟瀹氫箟 ====================
+        # 浠巏nob_config.json鍔犺浇鎵€鏈夊彲浼樺寲鍙傛暟鐨勫畾涔?
+        # 鍖呭惈姣忎釜鍙傛暟鐨則ype(integer/float/enum), min, max, default, step绛?
         self.knobs_detail = parse_knob_config.get_knobs(
             config['tuning_config']['knob_config']
         )
-        print(f"已加载{len(self.knobs_detail)}个可优化参数")
+        print(f"已加载 {len(self.knobs_detail)} 个可优化参数")
         
-        # ==================== 第四步：初始化日志和连接信息 ====================
-        # 创建日志文件用于记录优化过程
+        # ==================== 绗洓姝ワ細鍒濆鍖栨棩蹇楀拰杩炴帴淇℃伅 ====================
+        # 鍒涘缓鏃ュ織鏂囦欢鐢ㄤ簬璁板綍浼樺寲杩囩▼
         self.logger = utils.get_logger(config['tuning_config']['log_path'])
-        self.logger.info(f"开始调优: 方法={self.method}, 预热={self.warmup}")
+        self.logger.info(f"寮€濮嬭皟浼? 鏂规硶={self.method}, 棰勭儹={self.warmup}")
         
-        # SSH连接信息（用于远程执行命令）
+        # SSH杩炴帴淇℃伅锛堢敤浜庤繙绋嬫墽琛屽懡浠わ級
         self.ssh_host = config['ssh_config']['host']
-        self.last_point = []  # 上一个评估的配置
+        self.last_point = []  # 涓婁竴涓瘎浼扮殑閰嶇疆
         
-        # ==================== 第五步：初始化压力测试工具 ====================
-        # 压力测试工具负责执行工作负载并收集性能指标
+        # ==================== 绗簲姝ワ細鍒濆鍖栧帇鍔涙祴璇曞伐鍏?====================
+        # 鍘嬪姏娴嬭瘯宸ュ叿璐熻矗鎵ц宸ヤ綔璐熻浇骞舵敹闆嗘€ц兘鎸囨爣
         if self.online == 'false':
-            # 离线采样模式：保存到offline_sample_*.jsonl
+            # 绂荤嚎閲囨牱妯″紡锛氫繚瀛樺埌offline_sample_*.jsonl
             self.stt = stress_testing_tool(
                 config, self.database, self.logger, self.offline_sample
             )
         else:
-            # 在线（微调）模式：保存到finetune_sample
+            # 鍦ㄧ嚎锛堝井璋冿級妯″紡锛氫繚瀛樺埌finetune_sample
             self.stt = stress_testing_tool(
                 config, self.database, self.logger, self.finetune_sample
             )
 
-        # ==================== 第六步：初始化安全约束相关 ====================
-        # 安全约束用于确保生成的参数配置在合法和安全的范围内
-        self.pre_safe = None    # 前验安全模型：约束搜索空间
-        self.post_safe = None   # 后验安全模型：验证生成配置
+        # ==================== 绗叚姝ワ細鍒濆鍖栧畨鍏ㄧ害鏉熺浉鍏?====================
+        # 瀹夊叏绾︽潫鐢ㄤ簬纭繚鐢熸垚鐨勫弬鏁伴厤缃湪鍚堟硶鍜屽畨鍏ㄧ殑鑼冨洿鍐?
+        self.pre_safe = None    # 鍓嶉獙瀹夊叏妯″瀷锛氱害鏉熸悳绱㈢┖闂?
+        self.post_safe = None   # 鍚庨獙瀹夊叏妯″瀷锛氶獙璇佺敓鎴愰厤缃?
         
-        # ==================== 第七步：加载工作负载向量库 ====================
-        # 用于工作负载相似性计算和工作负载映射
+        # ==================== 绗竷姝ワ細鍔犺浇宸ヤ綔璐熻浇鍚戦噺搴?====================
+        # 鐢ㄤ簬宸ヤ綔璐熻浇鐩镐技鎬ц绠楀拰宸ヤ綔璐熻浇鏄犲皠
         self.veclib = VectorLibrary(config['database_config']['database'])
         
-        # 尝试加载工作负载特征向量（用于工作负载映射）
+        # 灏濊瘯鍔犺浇宸ヤ綔璐熻浇鐗瑰緛鍚戦噺锛堢敤浜庡伐浣滆礋杞芥槧灏勶級
         feature_path = f"SuperWG/feature/{config['database_config']['database']}.json"
         try:
             with open(feature_path, 'r') as f:
                 features = json.load(f)
-            self.logger.info(f"已加载{len(features)}个工作负载的特征向量")
+            self.logger.info("已加载 %s 个工作负载的特征向量", len(features))
         except FileNotFoundError:
-            self.logger.warning(f"特征文件不存在: {feature_path}")
+            self.logger.warning("特征文件不存在: %s", feature_path)
             features = {}
         
-        # 当前工作负载ID
+        # 褰撳墠宸ヤ綔璐熻浇ID
         self.wl_id = config['benchmark_config']['workload_path']
         
-        # ==================== 第八步：工作负载映射 ====================
-        # 根据预热策略选择是否使用相似工作负载的历史数据
-        # 这可以加速当前工作负载的优化
+        # ==================== 绗叓姝ワ細宸ヤ綔璐熻浇鏄犲皠 ====================
+        # 鏍规嵁棰勭儹绛栫暐閫夋嫨鏄惁浣跨敤鐩镐技宸ヤ綔璐熻浇鐨勫巻鍙叉暟鎹?
+        # 杩欏彲浠ュ姞閫熷綋鍓嶅伐浣滆礋杞界殑浼樺寲
         
         if self.warmup == 'workload_map' and self.wl_id in features:
-            # workload_map: 使用3个最相似的工作负载
+            # workload_map: 浣跨敤3涓渶鐩镐技鐨勫伐浣滆礋杞?
             self.feature = features[self.wl_id]
             self.rh_data, self.matched_wl = self.workload_mapper(
                 config['database_config']['database'], k=3
             )
-            self.logger.info(f"找到{len(self.rh_data)}条相似工作负载的历史数据")
+            self.logger.info(f"鎵惧埌{len(self.rh_data)}鏉＄浉浼煎伐浣滆礋杞界殑鍘嗗彶鏁版嵁")
             
         elif self.warmup == 'rgpe' and self.wl_id in features:
-            # rgpe: 使用10个最相似的工作负载（更多样化）
+            # rgpe: 浣跨敤10涓渶鐩镐技鐨勫伐浣滆礋杞斤紙鏇村鏍峰寲锛?
             self.feature = features[self.wl_id]
             self.rh_data, self.matched_wl = self.workload_mapper(
                 config['database_config']['database'], k=10
             )
-            self.logger.info(f"找到{len(self.rh_data)}条相似工作负载的历史数据(RGPE)")
+            self.logger.info(f"鎵惧埌{len(self.rh_data)}鏉＄浉浼煎伐浣滆礋杞界殑鍘嗗彶鏁版嵁(RGPE)")
 
-        # ==================== 第九步：初始化安全模型 ====================
-        # 评估默认参数并初始化安全约束框架
+        # ==================== 绗節姝ワ細鍒濆鍖栧畨鍏ㄦā鍨?====================
+        # 璇勪及榛樿鍙傛暟骞跺垵濮嬪寲瀹夊叏绾︽潫妗嗘灦
         self.init_safe()
-        self.logger.info("调优器初始化完成")
+        self.logger.info("璋冧紭鍣ㄥ垵濮嬪寲瀹屾垚")
 
     def workload_mapper(self, database, k):
         matched_wls = self.veclib.find_most_similar(self.feature, k)
@@ -290,30 +282,30 @@ class tuner:
 
     def init_safe(self):
         """
-        初始化安全约束框架
+        鍒濆鍖栧畨鍏ㄧ害鏉熸鏋?
         
-        ==== 核心功能 ====
-        1. 清理旧的采样数据文件
-        2. 收集参数的搜索空间范围
-        3. 选择和测试默认配置
-        4. 初始化前验和后验安全模型
-        5. 进行缓存预热
+        ==== 鏍稿績鍔熻兘 ====
+        1. 娓呯悊鏃х殑閲囨牱鏁版嵁鏂囦欢
+        2. 鏀堕泦鍙傛暟鐨勬悳绱㈢┖闂磋寖鍥?
+        3. 閫夋嫨鍜屾祴璇曢粯璁ら厤缃?
+        4. 鍒濆鍖栧墠楠屽拰鍚庨獙瀹夊叏妯″瀷
+        5. 杩涜缂撳瓨棰勭儹
         
-        ==== 工作流程 ====
-        清理数据 → 收集边界 → 选择初始点 → 测试初始点 → 建立安全框架 → 缓存预热
+        ==== 宸ヤ綔娴佺▼ ====
+        娓呯悊鏁版嵁 鈫?鏀堕泦杈圭晫 鈫?閫夋嫨鍒濆鐐?鈫?娴嬭瘯鍒濆鐐?鈫?寤虹珛瀹夊叏妗嗘灦 鈫?缂撳瓨棰勭儹
         
-        ==== 预热策略说明 ====
-        - 'ours': 使用生成式模型预生成的参数（来自model_config.json）
-        - 'pilot': 基于tpch_origin配置添加±5%的随机扰动
-        - 其他: 使用参数的默认值
+        ==== 棰勭儹绛栫暐璇存槑 ====
+        - 'ours': 浣跨敤鐢熸垚寮忔ā鍨嬮鐢熸垚鐨勫弬鏁帮紙鏉ヨ嚜model_config.json锛?
+        - 'pilot': 鍩轰簬tpch_origin閰嶇疆娣诲姞卤5%鐨勯殢鏈烘壈鍔?
+        - 鍏朵粬: 浣跨敤鍙傛暟鐨勯粯璁ゅ€?
         
-        ==== 输出 ====
-        初始化两个安全模型：
-        - pre_safe: 在优化前约束搜索空间
-        - post_safe: 在参数生成后进行验证
+        ==== 杈撳嚭 ====
+        鍒濆鍖栦袱涓畨鍏ㄦā鍨嬶細
+        - pre_safe: 鍦ㄤ紭鍖栧墠绾︽潫鎼滅储绌洪棿
+        - post_safe: 鍦ㄥ弬鏁扮敓鎴愬悗杩涜楠岃瘉
         """
-        # ==================== 第一步：清理旧数据 ====================
-        # 删除上一次调优的临时文件，确保每次调优从干净状态开始
+        # ==================== 绗竴姝ワ細娓呯悊鏃ф暟鎹?====================
+        # 鍒犻櫎涓婁竴娆¤皟浼樼殑涓存椂鏂囦欢锛岀‘淇濇瘡娆¤皟浼樹粠骞插噣鐘舵€佸紑濮?
         
         if os.path.exists(self.inner_metric_sample):
             with open(self.inner_metric_sample, 'r+') as f:
@@ -333,76 +325,76 @@ class tuner:
             file = open(self.offline_sample + '.jsonl', 'w')
             file.close()
 
-        # ==================== 第二步：收集参数空间信息 ====================
-        # 从参数定义中提取每个参数的上界、下界和步长
-        # 这些信息用于SMAC优化器定义搜索空间
+        # ==================== 绗簩姝ワ細鏀堕泦鍙傛暟绌洪棿淇℃伅 ====================
+        # 浠庡弬鏁板畾涔変腑鎻愬彇姣忎釜鍙傛暟鐨勪笂鐣屻€佷笅鐣屽拰姝ラ暱
+        # 杩欎簺淇℃伅鐢ㄤ簬SMAC浼樺寲鍣ㄥ畾涔夋悳绱㈢┖闂?
         
-        step = []  # 参数步长列表
-        lb, ub = [], []  # 下界、上界列表
-        knob_default = {}  # 默认参数配置
+        step = []  # 鍙傛暟姝ラ暱鍒楄〃
+        lb, ub = [], []  # 涓嬬晫銆佷笂鐣屽垪琛?
+        knob_default = {}  # 榛樿鍙傛暟閰嶇疆
 
         for index, knob in enumerate(self.knobs_detail):
             detail = self.knobs_detail[knob]
             
             if detail['type'] in ['integer', 'float']:
-                # 数值参数：直接使用min/max
+                # 鏁板€煎弬鏁帮細鐩存帴浣跨敤min/max
                 lb.append(detail['min'])
                 ub.append(detail['max'])
             elif detail['type'] == 'enum':
-                # 枚举参数：将其转码为0-N的整数范围
+                # 鏋氫妇鍙傛暟锛氬皢鍏惰浆鐮佷负0-N鐨勬暣鏁拌寖鍥?
                 lb.append(0)
                 ub.append(len(detail['enum_values']) - 1)
             
-            # 记录默认值和步长
+            # 璁板綍榛樿鍊煎拰姝ラ暱
             knob_default[knob] = detail['default']
             step.append(detail['step'])
 
-        # ==================== 第三步：选择默认配置或初始点 ====================
-        # 根据预热策略选择不同的初始配置
+        # ==================== 绗笁姝ワ細閫夋嫨榛樿閰嶇疆鎴栧垵濮嬬偣 ====================
+        # 鏍规嵁棰勭儹绛栫暐閫夋嫨涓嶅悓鐨勫垵濮嬮厤缃?
         
         if self.warmup == 'ours':
-            # 'ours'策略：使用模型预生成的参数
-            # 这假设已有model_config.json文件包含每个工作负载的推荐参数
+            # 'ours'绛栫暐锛氫娇鐢ㄦā鍨嬮鐢熸垚鐨勫弬鏁?
+            # 杩欏亣璁惧凡鏈塵odel_config.json鏂囦欢鍖呭惈姣忎釜宸ヤ綔璐熻浇鐨勬帹鑽愬弬鏁?
             try:
                 model_config = json.load(open('model_config.json'))
                 workload = self.wl_id.split('SuperWG/res/gpt_workloads/')[1]
                 knob_default = model_config[workload]
-                self.logger.info(f"使用模型预生成的参数作为初始点")
+                self.logger.info("使用模型预生成的参数作为初始点")
             except (FileNotFoundError, KeyError) as e:
-                self.logger.warning(f"无法加载模型参数: {e}，使用默认值")
+                self.logger.warning("无法加载模型参数: %s，使用默认值", e)
                 
         elif self.warmup == 'pilot':
-            # 'pilot'策略：基于已知优秀配置的随机扰动
-            # 在tpch_origin周围添加±5%的噪声生成初始点
+            # 'pilot'绛栫暐锛氬熀浜庡凡鐭ヤ紭绉€閰嶇疆鐨勯殢鏈烘壈鍔?
+            # 鍦╰pch_origin鍛ㄥ洿娣诲姞卤5%鐨勫櫔澹扮敓鎴愬垵濮嬬偣
             origin_config = tpch_origin
             knob_default = add_noise(self.knobs_detail, origin_config, 0.05)
-            self.logger.info(f"使用pilot策略生成初始点")
+            self.logger.info("使用 pilot 策略生成初始点")
 
-        # ==================== 第四步：测试初始配置 ====================
-        # 评估选定的初始配置以确定基线性能
+        # ==================== 绗洓姝ワ細娴嬭瘯鍒濆閰嶇疆 ====================
+        # 璇勪及閫夊畾鐨勫垵濮嬮厤缃互纭畾鍩虹嚎鎬ц兘
         
-        print('测试初始参数配置性能...')
+        print('娴嬭瘯鍒濆鍙傛暟閰嶇疆鎬ц兘...')
         print(knob_default)
         
         default_performance = self.stt.test_config(knob_default)
         
-        print(f'初始性能评分: {default_performance}')
-        self.logger.info(f"初始配置性能: {default_performance}")
+        print(f'鍒濆鎬ц兘璇勫垎: {default_performance}')
+        self.logger.info(f"鍒濆閰嶇疆鎬ц兘: {default_performance}")
 
-        # ==================== 第五步：初始化安全约束框架 ====================
-        # 创建前验安全模型，用于在优化过程中约束参数搜索空间
+        # ==================== 绗簲姝ワ細鍒濆鍖栧畨鍏ㄧ害鏉熸鏋?====================
+        # 鍒涘缓鍓嶉獙瀹夊叏妯″瀷锛岀敤浜庡湪浼樺寲杩囩▼涓害鏉熷弬鏁版悳绱㈢┖闂?
         
         self.pre_safe = Safe(
-            default_performance,    # 默认配置的性能
-            knob_default,          # 默认参数配置
-            default_performance,   # 当前最佳性能
-            lb,                    # 参数下界
-            ub,                    # 参数上界
-            step                   # 参数步长
+            default_performance,    # 榛樿閰嶇疆鐨勬€ц兘
+            knob_default,          # 榛樿鍙傛暟閰嶇疆
+            default_performance,   # 褰撳墠鏈€浣虫€ц兘
+            lb,                    # 鍙傛暟涓嬬晫
+            ub,                    # 鍙傛暟涓婄晫
+            step                   # 鍙傛暟姝ラ暱
         )
         
-        # 加载后验安全模型（若存在）
-        # 后验安全模型用于在参数生成后进行验证和约束
+        # 鍔犺浇鍚庨獙瀹夊叏妯″瀷锛堣嫢瀛樺湪锛?
+        # 鍚庨獙瀹夊叏妯″瀷鐢ㄤ簬鍦ㄥ弬鏁扮敓鎴愬悗杩涜楠岃瘉鍜岀害鏉?
         try:
             with open('safe/predictor.pickle', 'rb') as f:
                 self.post_safe = pickle.load(f)
@@ -411,221 +403,113 @@ class tuner:
             self.logger.warning("后验安全模型不存在，将跳过后验检查")
             self.post_safe = None
 
-        # ==================== 第六步：缓存预热 ====================
-        # 运行4次初始配置以充分预热数据库缓存
-        # 确保后续性能测试得到稳定的结果
+        # ==================== 绗叚姝ワ細缂撳瓨棰勭儹 ====================
+        # 杩愯4娆″垵濮嬮厤缃互鍏呭垎棰勭儹鏁版嵁搴撶紦瀛?
+        # 纭繚鍚庣画鎬ц兘娴嬭瘯寰楀埌绋冲畾鐨勭粨鏋?
         
         for i in range(4):
-            self.logger.debug(f"缓存预热第{i+1}/4次")
+            self.logger.debug("缓存预热第 %s/4 次", i + 1)
             self.stt.test_config(knob_default)
         
-        # 记录初始点用于参考
+        # 璁板綍鍒濆鐐圭敤浜庡弬鑰?
         self.last_point = list(knob_default.values())
         
-        # 可选：训练后验安全模型（需要大量历史数据）
+        # 鍙€夛細璁粌鍚庨獙瀹夊叏妯″瀷锛堥渶瑕佸ぇ閲忓巻鍙叉暟鎹級
         # self.post_safe.train(data_path='./')
 
     def tune(self) -> float | None:
         """
-        调优主入口
+        璋冧紭涓诲叆鍙?
         
-        根据配置的方法调用相应的优化算法
+        鏍规嵁閰嶇疆鐨勬柟娉曡皟鐢ㄧ浉搴旂殑浼樺寲绠楁硶
         
-        参数：
-            无
+        鍙傛暟锛?
+            鏃?
         
-        返回：
-            无（结果保存到文件）
+        杩斿洖锛?
+            鏃狅紙缁撴灉淇濆瓨鍒版枃浠讹級
         """
         if self.method == 'SMAC':
             return self.SMAC()
-        # 可以在这里添加其他优化方法
-        # elif self.method == 'BOHB':
+        # 鍙互鍦ㄨ繖閲屾坊鍔犲叾浠栦紭鍖栨柟娉?        # elif self.method == 'BOHB':
         #     self.BOHB()
 
     def SMAC(self) -> float:
         """
-        SMAC (Sequential Model-Based Algorithm Configuration) 优化器
-        
-        ==== 算法原理 ====
-        1. 贝叶斯优化：使用高斯过程或随机森林建模性能函数
-        2. 获取函数：选择最有可能改进性能的下一个候选配置
-        3. 迭代：评估候选配置，更新模型，重复直到收敛或迭代限制
-        
-        ==== 关键步骤 ====
-        1. 定义参数配置空间（ConfigurationSpace）
-        2. 初始化SMAC优化器
-        3. 迭代运行：
-           - SMAC生成候选配置
-           - 测试配置的性能
-           - SMAC更新内部模型
-        4. 保存最优配置和历史记录
-        
-        ==== 输出 ====
-        - incumbent: 找到的最佳配置
-        - runhistory: 所有评估的历史记录
-        - 结果保存到smac_his/{workload}_{warmup}.json
-        
-        ==== 性能指标 ====
-        优化目标是最大化TPS（Transaction Per Second）
-        SMAC内部最小化负TPS（-TPS）
+        Run SMAC through the modern proposal generator plugin.
+
+        This keeps the legacy tuner entry point available while delegating the
+        actual optimization loop to the NumPy-2-compatible SMAC 2.x plugin.
         """
-        
-        print("开始SMAC优化过程...")
-        self.logger.info(f"===== SMAC优化开始 =====")
-        self.logger.info(f"样本数: {self.sampling_number}, 迭代数: {self.iteration}")
-        best_tps = 0.0
-        
-        # ==================== 第一步：定义性能目标函数 ====================
-        # 这个函数会被SMAC反复调用来评估候选配置的性能
-        
-        def get_neg_result(point):
-            """
-            内部目标函数：测试一个参数配置
-            
-            参数：
-                point: ConfigurationSpace中的一个配置对象
-            
-            返回：
-                float: 负的性能评分（SMAC最小化此值等价于最大化性能）
-            """
-            # 测试这个配置
-            nonlocal best_tps
-            y = self.stt.test_config(point)
-            
-            # SMAC最小化目标，所以如果我们要最大化TPS，返回-TPS
-            result = -y
-            best_tps = max(best_tps, float(y))
-            
-            self.logger.debug(f"评估配置，性能={y:.2f}")
-            return result
-        
-        # ==================== 第二步：定义配置空间 ====================
-        # ConfigurationSpace定义了所有参数及其范围，SMAC在此空间内搜索
-        
-        cs = ConfigurationSpace()
-        self.logger.info(f"定义配置空间: {len(self.knobs_detail)}个参数")
-        
-        for name in self.knobs_detail.keys():
-            detail = self.knobs_detail[name]
-            
-            if detail['type'] == 'integer':
-                # 整数参数：UniformIntegerHyperparameter
-                # 处理边界情况：min==max时添加1避免错误
-                min_val = detail['min']
-                max_val = detail['max']
-                if max_val == min_val: 
-                    max_val += 1
-                
-                knob = UniformIntegerHyperparameter(
-                    name, min_val, max_val, 
-                    default_value=detail['default']
-                )
-                
-            elif detail['type'] == 'float':
-                # 浮点参数：UniformFloatHyperparameter
-                knob = UniformFloatHyperparameter(
-                    name, detail['min'], detail['max'],
-                    default_value=detail['default']
-                )
-            
-            # 注：枚举参数在后续版本中可以通过CategoricalHyperparameter支持
-            cs.add_hyperparameter(knob)
 
-        # ==================== 第三步：初始化SMAC优化器 ====================
-        # 配置SMAC的运行参数
-        
-        runhistory = RunHistory()
-        
-        # 根据预热策略加载历史数据
-        # （当前代码中为空，可扩展为加载相似工作负载的数据）
-        if self.warmup == 'workload_map' or self.warmup == 'rgpe':
-            # 可以在这里添加历史数据以加速优化
-            pass
-        
-        # 生成输出目录名
-        save_workload = self.wl_id.split('SuperWG/res/gpt_workloads/')[1]
-        save_workload = save_workload.split('.wg')[0]
-        
-        # 对于RGPE策略，使用匹配的工作负载作为参考
-        if self.warmup == 'rgpe':
-            matched_workload = self.matched_wl.split('SuperWG/res/gpt_workloads/')[1]
-            matched_workload = matched_workload.split('.wg')[0]
-            output_dir = f"./{matched_workload}_smac_output"
-            model_dir = f"./models/{save_workload}"
-        else:
-            output_dir = f"./{save_workload}_smac_output"
-            model_dir = f"./models/{save_workload}"
-        
-        # 创建输出目录
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(model_dir, exist_ok=True)
-        
-        # 创建SMAC场景（optimization scenario）
-        scenario = Scenario({
-            "run_obj": "quality",           # 优化目标质量（而不是时间）
-            "runcount-limit": self.iteration,  # 最大评估次数
-            "cs": cs,                       # 配置空间
-            "deterministic": "true",        # 问题确定性（可重现）
-            "output_dir": output_dir,       # 输出目录
-            "save_model": "true",           # 保存优化模型
-            "local_results_path": model_dir # 本地结果路径
-        })
-        
-        # 创建SMAC优化器
-        smac = SMAC4HPO(
-            scenario=scenario,
-            rng=np.random.RandomState(42),  # 随机种子保证可重现性
-            tae_runner=get_neg_result,       # 目标函数
-            runhistory=runhistory           # 运行历史
+        print("开始 SMAC 优化过程...")
+        self.logger.info("===== SMAC 优化开始 =====")
+        self.logger.info("样本数: %s, 迭代数: %s", self.sampling_number, self.iteration)
+
+        workload_name = os.path.splitext(os.path.basename(self.wl_id))[0] or "unknown_workload"
+        state_dir = os.path.join("smac_state", workload_name)
+        os.makedirs(state_dir, exist_ok=True)
+        os.makedirs("smac_his", exist_ok=True)
+
+        generator = SMACProposalGenerator(
+            knobs_detail=self.knobs_detail,
+            output_dir=state_dir,
+            runcount_limit=self.iteration,
+            seed=42,
+            logger=self.logger,
         )
-        
-        # ==================== 第四步：运行优化 ====================
-        # SMAC迭代优化，在配置空间中搜索最优参数
-        
-        self.logger.info("开始迭代优化...")
-        incumbent = smac.optimize()  # 运行优化，返回最佳配置
-        self.logger.info("优化完成")
-        
-        print('SMAC优化完成')
-        print(f'最优配置类型: {type(incumbent)}')
-        print(f'最优配置: {incumbent}')
-        
-        # ==================== 第五步：提取和保存结果 ====================
-        # 处理优化结果
-        
-        runhistory = smac.runhistory
-        self.logger.info(f"总共评估了{len(runhistory.data)}个配置")
-        
-        # 将运行历史转换为JSON格式保存
-        def runhistory_to_json(runhistory):
-            """将SMAC运行历史转换为JSON格式"""
-            data_to_save = {}
-            for run_key in runhistory.data.keys():
-                config_id, instance_id, seed, budget = run_key
-                run_value = runhistory.data[run_key]
-                data_to_save[str(run_key)] = {
-                    "cost": run_value.cost,
-                    "time": run_value.time,
-                    "status": run_value.status.name if hasattr(run_value.status, 'name') else str(run_value.status),
-                    "additional_info": run_value.additional_info
-                }
-            return json.dumps(data_to_save, indent=4)
 
-        # 保存结果
-        os.makedirs('smac_his', exist_ok=True)
-        result_file = f"smac_his/{save_workload}_{self.warmup}.json"
-        
-        with open(result_file, "w") as f:
-            f.write(runhistory_to_json(runhistory))
-        
-        self.logger.info(f"优化结果已保存到: {result_file}")
-        
-        self.logger.info(f"===== SMAC优化完成 =====")
+        history = []
+        trial_records = []
+        best_tps = 0.0
+        workload_features = {}
+
+        for iteration_index in range(self.iteration):
+            proposals = generator.generate(
+                workload_features=workload_features,
+                history=history,
+                constraints=self.knobs_detail,
+                n=1,
+            )
+            if not proposals:
+                self.logger.warning("SMAC 在第 %s 轮没有返回候选配置", iteration_index + 1)
+                continue
+
+            config = proposals[0]
+            tps = float(self.stt.test_config(config))
+            generator.tell(config, tps)
+            history.append({"config": config, "tps": tps})
+            trial_records.append(
+                {
+                    "iteration": iteration_index + 1,
+                    "config": config,
+                    "tps": tps,
+                    "cost": -tps,
+                }
+            )
+            best_tps = max(best_tps, tps)
+            self.logger.debug("第 %s 轮评估完成，性能=%.4f", iteration_index + 1, tps)
+
+        generator.save_state(generator.state_path)
+
+        result_file = os.path.join("smac_his", f"{workload_name}_{self.warmup}.json")
+        with open(result_file, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "workload": workload_name,
+                    "warmup_method": self.warmup,
+                    "iterations": self.iteration,
+                    "best_tps": best_tps,
+                    "trials": trial_records,
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        self.logger.info("总共评估了 %s 个配置", len(trial_records))
+        self.logger.info("优化结果已保存到: %s", result_file)
+        self.logger.info("===== SMAC 优化完成 =====")
+        print("SMAC 优化完成")
         print(f"优化结果已保存到: {result_file}")
         return best_tps
-
-    # def RGPE(self):
-    #     matched_workload = self.matched_wl.split('SuperWG/res/gpt_workloads/')[1]
-    #     matched_workload = matched_workload.split('.wg')[0]
-    #     return 
