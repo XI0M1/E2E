@@ -180,8 +180,42 @@ class Phase1Runner:
 
         return summary
 
+    def _count_completed_proposals(self, workload_id: str) -> int:
+        """
+        Count how many successful proposals have already been recorded
+        for this workload_id in the run metadata.
+        """
+        count = 0
+        for key in self.recorder.completed_keys:
+            # sample_key format: "{workload_id}:{sample_kind}:{hash}"
+            if key.startswith(f"{workload_id}:"):
+                count += 1
+        return count
+
     def _run_single_workload(self, workload_path: str) -> WorkloadRunResult:
         workload_id = self._workload_id_from_path(workload_path)
+
+        remaining_proposals = self.n_proposals_per_workload
+        if self.recorder.resume:
+            already_done = self._count_completed_proposals(workload_id)
+            if already_done >= self.n_proposals_per_workload:
+                self.logger.info(
+                    "Skipping workload %s: already has %d/%d completed proposals",
+                    workload_id,
+                    already_done,
+                    self.n_proposals_per_workload,
+                )
+                return WorkloadRunResult(
+                    workload_id=workload_id,
+                    total=already_done,
+                    success=already_done,
+                    failed=0,
+                    skipped=already_done,
+                    best_tps=None,
+                    samples=[],
+                )
+            remaining_proposals = self.n_proposals_per_workload - already_done
+
         self.logger.info("Running workload: %s", workload_id)
 
         if self.stt is not None:
@@ -196,7 +230,7 @@ class Phase1Runner:
         best_tps: float | None = None
         workload_features = self._load_workload_features(workload_path)
 
-        for proposal_index in range(self.n_proposals_per_workload):
+        for proposal_index in range(remaining_proposals):
             try:
                 proposals = self.generator.generate(
                     workload_features=workload_features,
