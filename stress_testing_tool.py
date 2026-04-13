@@ -192,7 +192,11 @@ class stress_testing_tool:
         使用 self.timeout 而非硬编码 60s，避免慢 workload 被误截断。
         """
         if iterations is None:
-            iterations = int(self.benchmark_config.get('warmup_iterations', 1))
+            try:
+                iterations = int(self.benchmark_config.get('warmup_iterations', 1))
+            except (ValueError, TypeError):
+                self.logger.warning("warmup_iterations 配置无效，使用默认值 1")
+                iterations = 1
         if iterations == 0:
             self.logger.debug("预热已禁用 (warmup_iterations=0)")
             return
@@ -278,8 +282,8 @@ class stress_testing_tool:
             statement_timeout_ms = self.timeout * 1000
 
         cursor = self.database.cursor
-        # SET LOCAL only affects the current transaction / statement
-        cursor.execute(f"SET LOCAL statement_timeout = {statement_timeout_ms}")
+        # SET LOCAL scopes the timeout to the current transaction block
+        cursor.execute(f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}")
         cursor.execute(statement)
 
         if cursor.description is not None:
