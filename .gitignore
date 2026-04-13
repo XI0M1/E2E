@@ -4,4 +4,5 @@ logs/*
 
 # 可选：如果你想保留文件夹本身但忽略里面的文件，可以只用这一行
 # logs/*
-# data/*__pycache__/
+# data/*
+__pycache__/
