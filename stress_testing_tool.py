@@ -183,21 +183,28 @@ class stress_testing_tool:
         except Exception as e:
             self.logger.error(f"配置应用失败: {e}")
     
-    def _warmup(self, iterations: int = 2):
+    def _warmup(self, iterations: int = None):
         """
-        预热缓存
-        
-        运行工作负载几次，使数据加载到缓存中，
-        后续测试结果更稳定。
-        
-        参数：
-            iterations (int): 预热迭代次数
+        预热缓存。
+
+        iterations 默认从 benchmark_config['warmup_iterations'] 读取，
+        未配置则为 1（只预热一次）。设为 0 可完全禁用预热。
+        使用 self.timeout 而非硬编码 60s，避免慢 workload 被误截断。
         """
+        if iterations is None:
+            try:
+                iterations = int(self.benchmark_config.get('warmup_iterations', 1))
+            except (ValueError, TypeError):
+                self.logger.warning("warmup_iterations 配置无效，使用默认值 1")
+                iterations = 1
+        if iterations == 0:
+            self.logger.debug("预热已禁用 (warmup_iterations=0)")
+            return
         try:
             workload_path = self.benchmark_config.get('workload_path', '')
             for i in range(iterations):
                 self.logger.debug(f"预热迭代 {i+1}/{iterations}")
-                self._run_workload(workload_path, timeout=60)
+                self._run_workload(workload_path, timeout=self.timeout)
         except Exception as e:
             self.logger.warning(f"预热失败: {e}")
     
@@ -259,13 +266,24 @@ class stress_testing_tool:
             self.logger.error(f"工作负载执行失败: {e}")
             return 0.0
 
-    def _execute_sql(self, sql: str):
-        """执行单条 SQL，兼容返回结果和无返回结果的语句。"""
+    def _execute_sql(self, sql: str, statement_timeout_ms: int = None):
+        """
+        执行单条 SQL，兼容返回结果和无返回结果的语句。
+
+        通过 PostgreSQL SET LOCAL statement_timeout 限制单条 SQL
+        的最长执行时间，防止一条慢 SQL 无限阻塞采样流程。
+        timeout 默认为 self.timeout * 1000ms（与 workload 级超时一致）。
+        """
         statement = sql.strip().rstrip(';')
         if not statement:
             return
 
+        if statement_timeout_ms is None:
+            statement_timeout_ms = self.timeout * 1000
+
         cursor = self.database.cursor
+        # SET LOCAL scopes the timeout to the current transaction block
+        cursor.execute(f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}")
         cursor.execute(statement)
 
         if cursor.description is not None:
