@@ -63,6 +63,11 @@ METRICS_BLACKLIST: frozenset[str] = frozenset(
         "tup_deleted",
         "live_tuples",
         "dead_tuples",
+        # always zero for pure-read OLAP workloads — pure noise
+        "xact_rollback",
+        # raw index fetch counter without normalisation — low signal-to-noise
+        # ratio; cache_hit_ratio already captures buffer efficiency
+        "idx_tup_fetch",
     }
 )
 
@@ -754,9 +759,13 @@ class TrainingDataBuilder:
             output_dir = os.path.dirname(self.output_path) or "."
             os.makedirs(output_dir, exist_ok=True)
 
-            with open(self.output_path, "w", encoding="utf-8") as handle:
+            # Write to a sibling temp file first, then rename atomically so a
+            # crash mid-write never leaves a partial training file on disk.
+            tmp_path = self.output_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
                 for sample in training_samples:
                     handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+            os.replace(tmp_path, self.output_path)
 
             self.last_stats = self._build_dataset_stats(training_samples)
             stats_path = self._dataset_stats_path()
