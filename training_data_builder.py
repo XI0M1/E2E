@@ -30,19 +30,63 @@ MEMORY_PARAMS = {
     "wal_buffers",
 }
 
+# ---------------------------------------------------------------------------
+# Metrics that must NEVER appear in the LLM input.
+#
+# Reasons:
+#   - LABEL_LEAKAGE: directly encodes the performance score used to select
+#     this config as the training label → the model learns a shortcut that
+#     does not generalise to inference time.
+#   - TIMESTAMP: unix epoch has zero causal relationship with knob values.
+#   - RAW_COUNTERS: heap_blks_read etc. are enormous raw integers with no
+#     normalisation; cache_hit_ratio already captures the same signal in a
+#     clean form.
+#   - ZERO_NOISE: tup_inserted / tup_updated / tup_deleted are always 0 for
+#     read-only OLAP workloads and add noise without signal.
+# ---------------------------------------------------------------------------
+METRICS_BLACKLIST: frozenset[str] = frozenset(
+    {
+        # label leakage
+        "performance_score",
+        # timestamp noise
+        "timestamp",
+        # raw counters already captured by cache_hit_ratio
+        "heap_blks_read",
+        "heap_blks_hit",
+        # byte-scale number without normalisation
+        "database_size",
+        # huge raw sequential scan counter
+        "seq_tup_read",
+        # always zero for read-only OLAP workloads
+        "tup_inserted",
+        "tup_updated",
+        "tup_deleted",
+        "live_tuples",
+        "dead_tuples",
+    }
+)
+
+# Path to the knob configuration file (used for output validation).
+_KNOB_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "knob_config",
+    "knob_config.json",
+)
+
 
 @dataclass
 class BuilderConfig:
     min_samples: int = 200
     max_samples: int = 300
-    max_plan_chars: int = 1000
+    max_plan_chars: int = 1500          # wider window so plans are not mid-sentence truncated
     max_plans_per_sample: int = 3
     instruction_lang: str = "zh"
-    output_format: str = "human"
+    output_format: str = "raw"          # raw keeps numeric types; avoids "2.1GB" string parsing issues
     deduplicate: bool = True
     min_tps: float = 0.1
     top_fraction: float = 0.33
     secondary_fraction: float = 0.167
+    validate_output_bounds: bool = True  # reject samples whose knob values exceed knob_config bounds
 
 
 @dataclass
@@ -58,6 +102,8 @@ class DatasetStats:
     avg_output_params: int
     validation_errors: int
     deduplication_removed: int
+    bound_violations_rejected: int = 0   # samples dropped by _validate_output_bounds
+    metrics_blacklist_applied: bool = True  # always True after Change 4
 
 
 class TrainingDataBuilder:
@@ -79,9 +125,11 @@ class TrainingDataBuilder:
         self.training_data: list[dict[str, str]] = []
         self.validation_errors = 0
         self.deduplication_removed = 0
+        self.bound_violations_rejected = 0
         self.last_stats: DatasetStats | None = None
         self._last_valid_source_samples: list[dict[str, Any]] = []
         self.workload_search_dirs = self._build_workload_search_dirs()
+        self._knob_bounds: dict[str, dict[str, float]] = self._load_knob_bounds()
 
     def _build_workload_search_dirs(self) -> list[str]:
         """Build workload search directories for both old and new layouts."""
@@ -106,6 +154,31 @@ class TrainingDataBuilder:
                 seen.add(normalized)
                 result.append(directory)
         return result
+
+    def _load_knob_bounds(self) -> dict[str, dict[str, float]]:
+        """
+        Load min/max bounds from knob_config.json for output validation.
+
+        Returns an empty dict if the file cannot be read; validation is then
+        skipped rather than crashing the build pipeline.
+        """
+        try:
+            with open(_KNOB_CONFIG_PATH, "r", encoding="utf-8") as handle:
+                raw: dict[str, Any] = json.load(handle)
+            bounds: dict[str, dict[str, float]] = {}
+            for knob_name, detail in raw.items():
+                lo = detail.get("min")
+                hi = detail.get("max")
+                if lo is not None and hi is not None:
+                    bounds[knob_name] = {"min": float(lo), "max": float(hi)}
+            logger.info("Loaded bounds for %d knobs from %s", len(bounds), _KNOB_CONFIG_PATH)
+            return bounds
+        except FileNotFoundError:
+            logger.warning("knob_config.json not found at %s; skipping bound validation", _KNOB_CONFIG_PATH)
+            return {}
+        except Exception as exc:
+            logger.warning("Failed to load knob bounds: %s; skipping bound validation", exc)
+            return {}
 
     def resolve_workload_path(self, sample: dict[str, Any]) -> str:
         """Prefer real paths from samples and fall back to name-based search."""
@@ -368,6 +441,10 @@ class TrainingDataBuilder:
         for key, value in inner_metrics.items():
             if key in priority_keys:
                 continue
+            # Skip fields that cause label leakage, timestamp noise, or raw
+            # counter bloat. See METRICS_BLACKLIST for individual reasons.
+            if key in METRICS_BLACKLIST:
+                continue
             if isinstance(value, float):
                 lines.append(f"- {key}: {value:.2f}")
             else:
@@ -457,7 +534,13 @@ class TrainingDataBuilder:
         )
 
     def _select_query_plans_text(self, query_plans_text: str) -> str:
-        """Limit query plans by count and by total prompt length."""
+        """
+        Select up to max_plans_per_sample query plans and truncate cleanly.
+
+        Truncation is done at the plan-block boundary rather than at an
+        arbitrary character offset to avoid feeding the LLM a partial plan
+        that looks like a complete one.
+        """
         if not query_plans_text:
             return "N/A"
 
@@ -466,8 +549,75 @@ class TrainingDataBuilder:
         if not selected_plans:
             return "N/A"
 
-        combined = "=== SQL" + "=== SQL".join(selected_plans)
-        return combined[: self.builder_config.max_plan_chars]
+        # Rebuild with the separator so each block starts with "=== SQL".
+        rebuilt_blocks: list[str] = []
+        total_chars = 0
+        for plan_block in selected_plans:
+            block_text = "=== SQL" + plan_block
+            if total_chars + len(block_text) > self.builder_config.max_plan_chars:
+                # Include a truncation marker so the LLM knows plans were cut.
+                rebuilt_blocks.append(
+                    f"[Plans truncated: {len(selected_plans) - len(rebuilt_blocks)} "
+                    f"plan(s) omitted due to length limit]"
+                )
+                break
+            rebuilt_blocks.append(block_text)
+            total_chars += len(block_text)
+
+        return "\n".join(rebuilt_blocks) if rebuilt_blocks else "N/A"
+
+    def _validate_output_bounds(
+        self,
+        config: dict[str, Any],
+        sample_index: int,
+    ) -> tuple[bool, list[str]]:
+        """
+        Check that every knob value in *config* lies within the bounds
+        declared in knob_config.json.
+
+        Returns:
+            (is_valid, violations)  where violations is a list of human-readable
+            descriptions of out-of-range values (empty when is_valid is True).
+
+        Notes:
+        - Skips validation silently when _knob_bounds is empty (file not found).
+        - Unknown knobs (not in bounds dict) are allowed through without error
+          so that future knobs do not break existing pipelines.
+        - Type coercion: numpy scalars are converted to Python floats before
+          comparison to avoid subtle np.int64 > float boundary surprises.
+        """
+        if not self._knob_bounds or not self.builder_config.validate_output_bounds:
+            return True, []
+
+        violations: list[str] = []
+        for knob_name, raw_value in config.items():
+            bounds = self._knob_bounds.get(knob_name)
+            if bounds is None:
+                continue  # unknown knob — pass through
+
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue  # non-numeric — skip bound check
+
+            lo, hi = bounds["min"], bounds["max"]
+            if value < lo:
+                violations.append(
+                    f"{knob_name}={value} is below min={lo}"
+                )
+            elif value > hi:
+                violations.append(
+                    f"{knob_name}={value} is above max={hi}"
+                )
+
+        if violations:
+            logger.debug(
+                "Sample %d output bound violations (%d): %s",
+                sample_index,
+                len(violations),
+                "; ".join(violations[:3]),
+            )
+        return len(violations) == 0, violations
 
     def build_training_samples(
         self,
@@ -476,6 +626,7 @@ class TrainingDataBuilder:
         """Build SFT-format training samples."""
         print("\n=== 构建 SFT 训练数据 ===\n")
         self.validation_errors = 0
+        self.bound_violations_rejected = 0
         self._last_valid_source_samples = []
 
         training_samples: list[dict[str, str]] = []
@@ -505,6 +656,22 @@ class TrainingDataBuilder:
 
                 output_json = self.format_config_as_output(sample["config"])
                 if not self.validate_output_json(output_json, index):
+                    continue
+
+                # Reject samples whose raw config values fall outside the
+                # declared knob bounds — these are SMAC edge-exploration
+                # results that would teach the LLM invalid configurations.
+                is_bounds_valid, bound_violations = self._validate_output_bounds(
+                    sample.get("config", {}), index
+                )
+                if not is_bounds_valid:
+                    self.bound_violations_rejected += 1
+                    logger.debug(
+                        "Sample %d skipped: %d bound violation(s): %s",
+                        index,
+                        len(bound_violations),
+                        "; ".join(bound_violations[:2]),
+                    )
                     continue
 
                 training_samples.append(
@@ -543,6 +710,8 @@ class TrainingDataBuilder:
                 avg_output_params=0,
                 validation_errors=self.validation_errors,
                 deduplication_removed=self.deduplication_removed,
+                bound_violations_rejected=self.bound_violations_rejected,
+                metrics_blacklist_applied=True,
             )
 
         workload_distribution: dict[str, int] = defaultdict(int)
@@ -570,6 +739,8 @@ class TrainingDataBuilder:
             avg_output_params=int(round(float(np.mean(output_param_counts)))),
             validation_errors=self.validation_errors,
             deduplication_removed=self.deduplication_removed,
+            bound_violations_rejected=self.bound_violations_rejected,
+            metrics_blacklist_applied=True,
         )
 
     def _dataset_stats_path(self) -> str:
@@ -658,7 +829,48 @@ def build_training_data(offline_sample_path: str, output_path: str) -> bool:
 
 
 if __name__ == "__main__":
-    build_training_data(
-        offline_sample_path="offline_sample/offline_sample_tpch.jsonl",
-        output_path="training_data/training_sft_data.jsonl",
+    import argparse as _argparse
+
+    _parser = _argparse.ArgumentParser(description="Rebuild SFT training data from offline samples")
+    _parser.add_argument(
+        "--database",
+        type=str,
+        default="tpch",
+        help="Database name (used to locate offline_sample/<db>/ and name output file)",
     )
+    _parser.add_argument(
+        "--host",
+        type=str,
+        default="localhost",
+        help="Host suffix used in the offline sample filename",
+    )
+    _parser.add_argument(
+        "--output-format",
+        type=str,
+        default="raw",
+        choices=["raw", "human"],
+        help="Output format for knob values: raw=numeric, human=human-readable strings",
+    )
+    _args = _parser.parse_args()
+
+    _sample_path = os.path.join(
+        "offline_sample",
+        _args.database,
+        f"offline_sample_{_args.database}_{_args.host}.jsonl",
+    )
+    _output_path = os.path.join(
+        "training_data",
+        f"training_sft_data_{_args.database}.jsonl",
+    )
+
+    print(f"Input:  {_sample_path}")
+    print(f"Output: {_output_path}")
+    print(f"Format: {_args.output_format}")
+
+    _cfg = BuilderConfig(output_format=_args.output_format)
+    _builder = TrainingDataBuilder(
+        offline_sample_path=_sample_path,
+        output_path=_output_path,
+        builder_config=_cfg,
+    )
+    raise SystemExit(0 if _builder.build_and_save() else 1)
