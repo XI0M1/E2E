@@ -287,7 +287,21 @@ class TrainingDataBuilder:
 
         selected_candidates: list[dict[str, Any]] = []
         for workload, samples in sorted(workload_samples.items()):
-            sorted_samples = sorted(samples, key=lambda item: float(item.get("tps", 0.0)), reverse=True)
+            def _sample_sort_key(item: dict) -> float:
+                avg_lat = item.get("avg_latency_ms")
+                if avg_lat is not None:
+                    try:
+                        v = float(avg_lat)
+                        if v > 1e-6:
+                            # Convert to a "higher is better" score so we can
+                            # keep reverse=True throughout (consistent with tps).
+                            return 1000.0 / v
+                    except (TypeError, ValueError):
+                        pass
+                # Fallback: use tps directly
+                return float(item.get("tps", 0.0))
+
+            sorted_samples = sorted(samples, key=_sample_sort_key, reverse=True)
             top_count = min(
                 len(sorted_samples),
                 max(1, int(np.ceil(len(sorted_samples) * cfg.top_fraction))),
