@@ -637,11 +637,25 @@ class TrainingDataBuilder:
         training_samples: list[dict[str, str]] = []
         instruction = self._get_instruction_text()
 
+        # Build a per-workload cache of query_plans from the first sample
+        # that has non-empty plans. Samples collected after the first proposal
+        # have query_plans="" because EXPLAIN is only run once per workload.
+        workload_plans_cache: dict[str, str] = {}
+        for _s in selected_samples:
+            _wk = str(_s.get("workload") or _s.get("workload_file") or "")
+            _qp = str(_s.get("query_plans") or "").strip()
+            if _wk and _qp and _wk not in workload_plans_cache:
+                workload_plans_cache[_wk] = _qp
+
         for index, sample in enumerate(selected_samples, 1):
             try:
                 workload_path = self.resolve_workload_path(sample)
                 workload_stats = self.extract_workload_statistics(workload_path)
-                query_plans_text = self._select_query_plans_text(sample.get("query_plans", ""))
+                _raw_plans = str(sample.get("query_plans") or "").strip()
+                if not _raw_plans:
+                    _wk = str(sample.get("workload") or sample.get("workload_file") or "")
+                    _raw_plans = workload_plans_cache.get(_wk, "")
+                query_plans_text = self._select_query_plans_text(_raw_plans)
                 metrics_text = self.format_metrics_text(sample.get("inner_metrics", {}))
 
                 input_text = (
