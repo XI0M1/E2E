@@ -553,3 +553,51 @@ class stress_testing_tool:
             
         except Exception as e:
             self.logger.warning(f"保存采样数据失败: {e}")
+
+    def patch_last_relative_score(self, relative_score: float) -> None:
+        """
+        Rewrite the relative_score field of the most-recently-written
+        record in the JSONL sample file.
+
+        This is called by the runner after computing relative_score
+        from the baseline, because test_config() writes the record
+        before the runner has a chance to compute the relative score.
+
+        The method rewrites the entire last line of the JSONL file
+        atomically (read all lines → patch last → write back).
+        """
+        sample_file = self.sample_path + '.jsonl'
+        if not os.path.exists(sample_file):
+            self.logger.warning(
+                "patch_last_relative_score: sample file not found: %s",
+                sample_file,
+            )
+            return
+        try:
+            with open(sample_file, 'r', encoding='utf-8') as fh:
+                lines = fh.readlines()
+            if not lines:
+                return
+            # Find the last non-empty line
+            last_idx = len(lines) - 1
+            while last_idx >= 0 and not lines[last_idx].strip():
+                last_idx -= 1
+            if last_idx < 0:
+                return
+            record = json.loads(lines[last_idx])
+            record['relative_score'] = float(relative_score)
+            lines[last_idx] = json.dumps(record, ensure_ascii=False) + '\n'
+            # Write atomically via temp file
+            tmp_file = sample_file + '.patching.tmp'
+            with open(tmp_file, 'w', encoding='utf-8') as fh:
+                fh.writelines(lines)
+            os.replace(tmp_file, sample_file)
+            self.logger.debug(
+                "Patched relative_score=%.4f into last record of %s",
+                relative_score,
+                sample_file,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "patch_last_relative_score failed: %s", exc
+            )
