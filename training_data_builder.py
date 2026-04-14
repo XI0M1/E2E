@@ -175,7 +175,11 @@ class TrainingDataBuilder:
                 lo = detail.get("min")
                 hi = detail.get("max")
                 if lo is not None and hi is not None:
-                    bounds[knob_name] = {"min": float(lo), "max": float(hi)}
+                    bounds[knob_name] = {
+                        "min": float(lo),
+                        "max": float(hi),
+                        "type": str(detail.get("type", "integer")),
+                    }
             logger.info("Loaded bounds for %d knobs from %s", len(bounds), _KNOB_CONFIG_PATH)
             return bounds
         except FileNotFoundError:
@@ -573,11 +577,25 @@ class TrainingDataBuilder:
                 encoded[knob_name] = raw_value
                 continue
 
-            if range_size <= 20:
-                # Small discrete range — keep actual value
+            knob_type = bounds.get("type", "integer")
+
+            # Sentinel values (-1 = "use system default") must be preserved
+            # exactly as-is; encoding them as percentile would corrupt the
+            # semantic meaning of the sentinel.
+            if v == -1.0 and lo <= -1.0:
+                encoded[knob_name] = -1
+                continue
+
+            if knob_type == "float":
+                # Float params always use percentile encoding regardless of
+                # range size — even a range of 1.0 can have 100 valid steps.
+                encoded[knob_name] = self._encode_to_percentile(v, lo, hi)
+            elif range_size <= 20:
+                # Small discrete integer range — keep actual value so the LLM
+                # can learn the exact integer directly.
                 encoded[knob_name] = int(round(v))
             else:
-                # Large range — encode as percentile
+                # Large integer range — encode as percentile.
                 encoded[knob_name] = self._encode_to_percentile(v, lo, hi)
 
         return json.dumps(encoded, ensure_ascii=False)
