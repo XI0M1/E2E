@@ -421,6 +421,13 @@ class Phase1Runner:
             if baseline_tps > 1e-6:
                 relative_score = (float(tps) - baseline_tps) / baseline_tps
 
+            # Patch the relative_score into the record that test_config just
+            # wrote, now that we have the real value (it was written as 0.0
+            # because test_config cannot compute it without baseline_tps).
+            patch_fn = getattr(self.stt, "patch_last_relative_score", None)
+            if callable(patch_fn):
+                patch_fn(relative_score)
+
             metadata["baseline_tps"] = baseline_tps
             metadata["relative_score"] = relative_score
             return self._finalize_result(
