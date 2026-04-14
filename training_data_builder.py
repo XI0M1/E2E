@@ -81,8 +81,8 @@ _KNOB_CONFIG_PATH = os.path.join(
 
 @dataclass
 class BuilderConfig:
-    min_samples: int = 200
-    max_samples: int = 300
+    min_samples: int = 400
+    max_samples: int = 500
     max_plan_chars: int = 1500          # wider window so plans are not mid-sentence truncated
     max_plans_per_sample: int = 3
     instruction_lang: str = "zh"
@@ -860,6 +860,18 @@ if __name__ == "__main__":
         choices=["raw", "human"],
         help="Output format for knob values: raw=numeric, human=human-readable strings",
     )
+    _parser.add_argument(
+        "--min-samples",
+        type=int,
+        default=None,
+        help="Minimum number of training samples to select (overrides BuilderConfig default)",
+    )
+    _parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of training samples to select (overrides BuilderConfig default)",
+    )
     _args = _parser.parse_args()
 
     _sample_path = os.path.join(
@@ -877,6 +889,10 @@ if __name__ == "__main__":
     print(f"Format: {_args.output_format}")
 
     _cfg = BuilderConfig(output_format=_args.output_format)
+    if _args.min_samples is not None:
+        _cfg.min_samples = _args.min_samples
+    if _args.max_samples is not None:
+        _cfg.max_samples = _args.max_samples
     _builder = TrainingDataBuilder(
         offline_sample_path=_sample_path,
         output_path=_output_path,

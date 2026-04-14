@@ -58,6 +58,7 @@ class stress_testing_tool:
         
         # 新增：保存workload_file路径（用于后续提取SQL统计和执行计划）
         self.workload_file = self.benchmark_config.get('workload_path', '')
+        self._plans_collected_for: set[str] = set()
         if not os.path.exists(self.workload_file):
             self.logger.warning(f"Workload文件不存在: {self.workload_file}")
         if self.parameter_subsystem is None and self.database:
@@ -138,8 +139,18 @@ class stress_testing_tool:
             # 4. 收集系统指标
             metrics = self._collect_metrics(config, performance)
             
-            # 5. 采集Query Plans（在当前参数配置下）
-            query_plans = self._collect_query_plans()
+            # 5. 采集Query Plans（在当前参数配置下，仅在首次采集）
+            workload_key = self.benchmark_config.get('workload_path', '')
+            if workload_key and workload_key not in self._plans_collected_for:
+                query_plans = self._collect_query_plans()
+                if query_plans:
+                    self._plans_collected_for.add(workload_key)
+            else:
+                query_plans = ""
+                self.logger.debug(
+                    "Skipping query plan collection for %s (already collected)",
+                    workload_key,
+                )
             
             # 6. 保存结果
             sample_data = {
