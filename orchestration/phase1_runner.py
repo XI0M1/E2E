@@ -222,6 +222,10 @@ class Phase1Runner:
 
         self.logger.info("Running workload: %s", workload_id)
 
+        if self.stt is not None:
+            self.stt.benchmark_config["workload_path"] = workload_path
+            self.stt.workload_file = workload_path
+                    
         baseline_result: dict = {}
         if self.stt is not None and not self.dry_run:
             baseline_result = self._run_baseline(workload_path)
@@ -229,10 +233,6 @@ class Phase1Runner:
             baseline_result = {"baseline_tps": 0.0, "baseline_runs": []}
 
         baseline_tps: float = baseline_result.get("baseline_tps", 0.0)
-
-        if self.stt is not None:
-            self.stt.benchmark_config["workload_path"] = workload_path
-            self.stt.workload_file = workload_path
 
         samples: List[SampleResult] = []
         history: List[Dict[str, Any]] = []
