@@ -74,6 +74,7 @@ class stress_testing_tool:
         apply_static: bool = None,
         restart_if_static: bool = None,
         sample_metadata: Dict[str, Any] = None,
+        relative_score: float = 0.0,
     ) -> float:
         """
         测试给定的参数配置
@@ -133,8 +134,14 @@ class stress_testing_tool:
             # 3. 执行测试工作负载
             self.logger.info("执行工作负载测试...")
             workload_path = self.benchmark_config.get('workload_path', '')
-            performance = self._run_workload(workload_path)
-            self.logger.info(f"工作负载完成，性能评分: {performance:.2f}")
+            workload_result = self._run_workload(workload_path)
+            performance = workload_result["tps"]
+            avg_latency_ms = workload_result["avg_latency_ms"]
+            workload_type = workload_result.get("workload_type", "olap")
+            self.logger.info(
+                f"工作负载完成: tps={performance:.3f}, "
+                f"avg_latency_ms={avg_latency_ms:.1f}ms"
+            )
             
             # 4. 收集系统指标
             metrics = self._collect_metrics(config, performance)
@@ -156,6 +163,9 @@ class stress_testing_tool:
             sample_data = {
                 'config': config,
                 'performance': performance,
+                'avg_latency_ms': avg_latency_ms,
+                'workload_type': workload_type,
+                'relative_score': relative_score,
                 'metrics': metrics,
                 'query_plans': query_plans,
                 'apply_static': apply_static,
@@ -215,13 +225,14 @@ class stress_testing_tool:
             workload_path = self.benchmark_config.get('workload_path', '')
             for i in range(iterations):
                 self.logger.debug(f"预热迭代 {i+1}/{iterations}")
-                self._run_workload(workload_path, timeout=self.timeout)
+                result = self._run_workload(workload_path, timeout=self.timeout)
+                _ = result  # warmup result discarded
         except Exception as e:
             self.logger.warning(f"预热失败: {e}")
     
-    def _run_workload(self, workload_path: str, timeout: int = None) -> float:
+    def _run_workload(self, workload_path: str, timeout: int = None) -> dict:
         """
-        执行工作负载并返回性能评分
+        执行工作负载并返回性能结果字典
         
         支持的工作负载类型：
             - TPC-H: OLAP基准测试
@@ -234,7 +245,7 @@ class stress_testing_tool:
             timeout (int): 执行超时时间（秒）
         
         返回：
-            float: 工作负载执行的性能评分
+            dict: 包含 tps, avg_latency_ms, elapsed_s, sql_count, workload_type 的结果字典
         """
         if timeout is None:
             timeout = self.timeout
@@ -244,12 +255,14 @@ class stress_testing_tool:
 
             if not self.database:
                 self.logger.warning("没有数据库连接，无法执行真实 workload")
-                return 0.0
+                return {"tps": 0.0, "avg_latency_ms": 0.0, "elapsed_s": 0.0,
+                        "sql_count": 0, "workload_type": "olap"}
 
             sqls = self._load_sqls_from_file(workload_path)
             if not sqls:
                 self.logger.warning(f"Workload 中没有可执行 SQL: {workload_path}")
-                return 0.0
+                return {"tps": 0.0, "avg_latency_ms": 0.0, "elapsed_s": 0.0,
+                        "sql_count": 0, "workload_type": "olap"}
 
             start_time = time.time()
             executed_sqls = 0
@@ -264,18 +277,29 @@ class stress_testing_tool:
             if elapsed_time <= 0:
                 elapsed_time = 1e-6
 
-            tps = executed_sqls / elapsed_time
+            tps = executed_sqls / max(elapsed_time, 1e-6)
+            avg_latency_ms = (elapsed_time / max(executed_sqls, 1)) * 1000.0
             self.logger.info(
-                f"Workload 执行完成: sqls={executed_sqls}, elapsed={elapsed_time:.3f}s, score={tps:.3f}"
+                f"Workload 执行完成: sqls={executed_sqls}, "
+                f"elapsed={elapsed_time:.3f}s, tps={tps:.3f}, "
+                f"avg_latency_ms={avg_latency_ms:.1f}ms"
             )
-            return max(tps, 1e-6)
+            return {
+                "tps": max(tps, 1e-6),
+                "avg_latency_ms": avg_latency_ms,
+                "elapsed_s": elapsed_time,
+                "sql_count": executed_sqls,
+                "workload_type": "olap",
+            }
             
         except subprocess.TimeoutExpired:
             self.logger.warning(f"工作负载执行超时（{timeout}s）")
-            return 0.0
+            return {"tps": 0.0, "avg_latency_ms": 0.0, "elapsed_s": float(timeout),
+                    "sql_count": 0, "workload_type": "olap"}
         except Exception as e:
             self.logger.error(f"工作负载执行失败: {e}")
-            return 0.0
+            return {"tps": 0.0, "avg_latency_ms": 0.0, "elapsed_s": 0.0,
+                    "sql_count": 0, "workload_type": "olap"}
 
     def _execute_sql(self, sql: str, statement_timeout_ms: int = None):
         """
@@ -501,16 +525,19 @@ class stress_testing_tool:
             output_data = {
                 'config': config,
                 'performance': performance,
+                'tps': performance,
+                'avg_latency_ms': sample_data.get('avg_latency_ms', 0.0),
+                'workload_type': sample_data.get('workload_type', 'olap'),
+                'relative_score': sample_data.get('relative_score', 0.0),
                 'metrics': metrics,
+                'inner_metrics': metrics,
                 'query_plans': query_plans,
                 'apply_static': apply_static,
                 'restart_performed': restart_performed,
                 'config_stats': config_stats,
                 'workload': self.benchmark_config.get('workload_path', 'unknown'),
                 'workload_file': os.path.basename(self.workload_file),
-                'y': -performance,  # 用于最小化优化
-                'tps': performance,
-                'inner_metrics': metrics
+                'y': -performance,
             }
             
             # 追加到JSONL文件
