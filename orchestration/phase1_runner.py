@@ -18,6 +18,7 @@ from time import perf_counter
 from typing import Any, Dict, List
 
 from feature_extractor import extract_workload_features
+from orchestration.baseline_store import BaselineStore
 from proposal_generators.base import ProposalGenerator
 from sampling_runtime import SamplingRunRecorder
 from training_data_builder import build_training_data
@@ -70,6 +71,7 @@ class Phase1Runner:
         n_proposals_per_workload: int = 30,
         max_workloads: int | None = None,
         dry_run: bool = False,
+        baseline_store: BaselineStore | None = None,
     ) -> None:
         self.config = config
         self.generator = generator
@@ -81,6 +83,7 @@ class Phase1Runner:
         self.n_proposals_per_workload = n_proposals_per_workload
         self.max_workloads = max_workloads
         self.dry_run = dry_run
+        self.baseline_store = baseline_store
         self.logger = getattr(stt, "logger", logging.getLogger("Phase1Runner"))
 
     def discover_workloads(self) -> list[str]:
@@ -317,28 +320,36 @@ class Phase1Runner:
             name: detail["default"]
             for name, detail in self.knobs_detail.items()
         }
-        try:
-            r1 = self.stt.test_config(default_config)
-            r2 = self.stt.test_config(default_config)
-            r3 = self.stt.test_config(default_config)
-            median_tps = statistics.median([r1, r2, r3])
-            self.logger.info(
-                "Baseline for %s: tps=%.3f (runs=%.3f,%.3f,%.3f)",
-                workload_id,
-                median_tps,
-                r1,
-                r2,
-                r3,
+
+        if self.baseline_store is not None:
+            result = self.baseline_store.get_or_measure(
+                workload_id=workload_id,
+                stt=self.stt,
+                default_config=default_config,
             )
-            return {
-                "baseline_tps": float(median_tps),
-                "baseline_runs": [float(r1), float(r2), float(r3)],
-            }
-        except Exception:
-            self.logger.warning(
-                "Baseline measurement failed for %s", workload_id, exc_info=True
-            )
-            return {"baseline_tps": 0.0, "baseline_runs": []}
+        else:
+            try:
+                r1 = self.stt.test_config(default_config)
+                r2 = self.stt.test_config(default_config)
+                r3 = self.stt.test_config(default_config)
+                median_tps = statistics.median([r1, r2, r3])
+                result = {
+                    "baseline_tps": float(median_tps),
+                    "baseline_runs": [float(r1), float(r2), float(r3)],
+                }
+            except Exception:
+                self.logger.warning(
+                    "Baseline measurement failed for %s", workload_id, exc_info=True
+                )
+                result = {"baseline_tps": 0.0, "baseline_runs": []}
+
+        self.logger.info(
+            "Baseline for %s: tps=%.3f runs=%s",
+            workload_id,
+            result["baseline_tps"],
+            result["baseline_runs"],
+        )
+        return result
 
     def _run_single_config(
         self,

@@ -13,6 +13,7 @@ from Database import Database
 from config import parse_config
 from knob_config import parse_knob_config
 from orchestration.phase1_runner import Phase1RunSummary, Phase1Runner
+from orchestration.baseline_store import BaselineStore
 from parameter_subsystem import ParameterExecutionSubsystem
 from proposal_generators import get_generator
 from sampling_runtime import SamplingRunRecorder
@@ -128,6 +129,19 @@ def build_generator(
     return get_generator(strategy, **generator_kwargs)
 
 
+def build_baseline_store(
+    config: dict[str, Any],
+    dry_run: bool,
+) -> BaselineStore | None:
+    """Build a BaselineStore co-located with the offline sample output."""
+    if dry_run:
+        return None
+    sample_prefix = config["tuning_config"]["offline_sample"]
+    store_dir = os.path.dirname(sample_prefix) or "offline_sample"
+    store_path = os.path.join(store_dir, "baseline_records.jsonl")
+    return BaselineStore(store_path)
+
+
 def build_stress_testing_tool(
     config: dict[str, Any],
     logger: logging.Logger,
@@ -192,6 +206,7 @@ def main() -> int:
     )
     recorder = SamplingRunRecorder(metadata_path, resume=cli_args.resume)
     stt = build_stress_testing_tool(config, logger, dry_run=cli_args.dry_run)
+    baseline_store = build_baseline_store(config, dry_run=cli_args.dry_run)
 
     runner = Phase1Runner(
         config=config,
@@ -204,6 +219,7 @@ def main() -> int:
         n_proposals_per_workload=cli_args.n_proposals,
         max_workloads=cli_args.max_workloads,
         dry_run=cli_args.dry_run,
+        baseline_store=baseline_store,
     )
 
     summary = runner.run()
