@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import statistics
 import traceback
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -218,6 +219,14 @@ class Phase1Runner:
 
         self.logger.info("Running workload: %s", workload_id)
 
+        baseline_result: dict = {}
+        if self.stt is not None and not self.dry_run:
+            baseline_result = self._run_baseline(workload_path)
+        else:
+            baseline_result = {"baseline_tps": 0.0, "baseline_runs": []}
+
+        baseline_tps: float = baseline_result.get("baseline_tps", 0.0)
+
         if self.stt is not None:
             self.stt.benchmark_config["workload_path"] = workload_path
             self.stt.workload_file = workload_path
@@ -272,6 +281,7 @@ class Phase1Runner:
                 workload_id=workload_id,
                 config=proposals[0],
                 sample_kind=self.generator.name,
+                baseline_tps=baseline_tps,
             )
             sample_result.metadata.setdefault("proposal_index", proposal_index)
             samples.append(sample_result)
@@ -301,11 +311,41 @@ class Phase1Runner:
             samples=samples,
         )
 
+    def _run_baseline(self, workload_path: str) -> dict:
+        workload_id = self._workload_id_from_path(workload_path)
+        default_config = {
+            name: detail["default"]
+            for name, detail in self.knobs_detail.items()
+        }
+        try:
+            r1 = self.stt.test_config(default_config)
+            r2 = self.stt.test_config(default_config)
+            r3 = self.stt.test_config(default_config)
+            median_tps = statistics.median([r1, r2, r3])
+            self.logger.info(
+                "Baseline for %s: tps=%.3f (runs=%.3f,%.3f,%.3f)",
+                workload_id,
+                median_tps,
+                r1,
+                r2,
+                r3,
+            )
+            return {
+                "baseline_tps": float(median_tps),
+                "baseline_runs": [float(r1), float(r2), float(r3)],
+            }
+        except Exception:
+            self.logger.warning(
+                "Baseline measurement failed for %s", workload_id, exc_info=True
+            )
+            return {"baseline_tps": 0.0, "baseline_runs": []}
+
     def _run_single_config(
         self,
         workload_id: str,
         config: dict,
         sample_kind: str,
+        baseline_tps: float = 0.0,
     ) -> SampleResult:
         started = perf_counter()
         metadata = {
@@ -363,6 +403,15 @@ class Phase1Runner:
 
         try:
             tps = self.stt.test_config(validation_config)
+
+            # Compute relative improvement over default config baseline.
+            # relative_score > 0 means better than default; < 0 means worse.
+            relative_score: float = 0.0
+            if baseline_tps > 1e-6:
+                relative_score = (float(tps) - baseline_tps) / baseline_tps
+
+            metadata["baseline_tps"] = baseline_tps
+            metadata["relative_score"] = relative_score
             return self._finalize_result(
                 SampleResult(
                     sample_key=sample_key,
