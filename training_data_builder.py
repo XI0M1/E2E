@@ -86,7 +86,7 @@ class BuilderConfig:
     max_plan_chars: int = 1500          # wider window so plans are not mid-sentence truncated
     max_plans_per_sample: int = 3
     instruction_lang: str = "zh"
-    output_format: str = "raw"          # raw keeps numeric types; avoids "2.1GB" string parsing issues
+    output_format: str = "percentile"   # percentile maps values to 0-100 integers for LLM-friendliness
     deduplicate: bool = True
     min_tps: float = 0.1
     top_fraction: float = 0.33
@@ -491,15 +491,37 @@ class TrainingDataBuilder:
             return str(int(value))
         return str(value)
 
+    @staticmethod
+    def _encode_to_percentile(value: float, lo: float, hi: float) -> int:
+        """Map a continuous knob value to a 0-100 integer percentile."""
+        if hi <= lo:
+            return 50
+        pct = (float(value) - lo) / (hi - lo) * 100.0
+        return int(round(max(0.0, min(100.0, pct))))
+
+    @staticmethod
+    def _decode_from_percentile(pct: int, lo: float, hi: float,
+                                 step: float = 1.0) -> float:
+        """Restore a knob value from its 0-100 percentile."""
+        raw = lo + (hi - lo) * float(pct) / 100.0
+        if step > 0:
+            raw = round(raw / step) * step
+        return max(lo, min(hi, raw))
+
     def format_config_as_output(self, config: dict[str, Any]) -> str:
         """
         Format a config into the configured output JSON mode.
 
+        percentile mode:
+            encodes each knob value as a 0-100 integer percentile.
         raw mode:
             preserves native ints/floats and is easier for LLM post-processing.
         human mode:
             converts every value to a string for consistent prompt targets.
         """
+        if self.builder_config.output_format == "percentile":
+            return self.format_config_as_percentile(config)
+
         if self.builder_config.output_format == "raw":
             normalized = {
                 key: (value.item() if isinstance(value, np.generic) else value)
@@ -517,6 +539,48 @@ class TrainingDataBuilder:
             for key, value in sorted(config.items())
         }
         return json.dumps(normalized, ensure_ascii=False, indent=2)
+
+    def format_config_as_percentile(self, config: dict[str, Any]) -> str:
+        """
+        Encode every knob value as a 0-100 integer percentile.
+
+        Knobs whose range is <= 20 discrete steps are kept as their
+        actual integer value (the range is already small enough for the
+        LLM to learn directly).
+
+        Returns a JSON string, e.g.:
+            {"shared_buffers": 36, "work_mem": 48, "join_collapse_limit": 8}
+        """
+        encoded: dict[str, Any] = {}
+        for knob_name, raw_value in sorted(config.items()):
+            bounds = self._knob_bounds.get(knob_name)
+            if bounds is None:
+                # Unknown knob — pass through unchanged
+                encoded[knob_name] = (
+                    raw_value.item()
+                    if isinstance(raw_value, np.generic)
+                    else raw_value
+                )
+                continue
+
+            lo = bounds["min"]
+            hi = bounds["max"]
+            range_size = hi - lo
+
+            try:
+                v = float(raw_value)
+            except (TypeError, ValueError):
+                encoded[knob_name] = raw_value
+                continue
+
+            if range_size <= 20:
+                # Small discrete range — keep actual value
+                encoded[knob_name] = int(round(v))
+            else:
+                # Large range — encode as percentile
+                encoded[knob_name] = self._encode_to_percentile(v, lo, hi)
+
+        return json.dumps(encoded, ensure_ascii=False)
 
     def format_config_as_human_readable(self, config: dict[str, Any]) -> str:
         """Backward-compatible wrapper around the new configurable formatter."""
@@ -884,9 +948,10 @@ if __name__ == "__main__":
     _parser.add_argument(
         "--output-format",
         type=str,
-        default="raw",
-        choices=["raw", "human"],
-        help="Output format for knob values: raw=numeric, human=human-readable strings",
+        default="percentile",
+        choices=["percentile", "raw", "human"],
+        help="Output format: percentile=0-100 integers (default), "
+             "raw=numeric, human=human-readable strings",
     )
     _parser.add_argument(
         "--min-samples",
