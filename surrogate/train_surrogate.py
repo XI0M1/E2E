@@ -1,471 +1,566 @@
 """
-代理模型训练模块（Surrogate Model Training）
-功能：训练生成式语言模型作为参数调优的代理，快速生成参数推荐
-
-核心思想：
-    使用预训练的大语言模型（如Qwen2.5-7B）学习工作负载特征到参数配置的映射，
-    通过微调使其能够为数据库工作负载直接生成优化参数，避免多轮反复调优。
+Dependencies: transformers, peft, datasets, torch, numpy
 """
 
-import os
+from __future__ import annotations
+
+import argparse
+import inspect
 import json
-import pickle
 import logging
-from datetime import datetime
+import os
+from dataclasses import dataclass
+from glob import glob
+from typing import Any
+
 import numpy as np
+import torch
+from datasets import Dataset
+from datasets import DatasetDict
+from peft import LoraConfig
+from peft import TaskType
+from peft import get_peft_model
+from transformers import AutoModelForCausalLM
+from transformers import AutoTokenizer
+from transformers import DataCollatorForSeq2Seq
+from transformers import Trainer
+from transformers import TrainingArguments
+from transformers import set_seed
+
+
+LOGGER = logging.getLogger("surrogate.train_surrogate")
+DEFAULT_MODEL_ALIAS = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_LOCAL_MODEL_PATH = "/root/data/models/Qwen2.5-7B-Instruct"
+REQUIRED_FIELDS = ("instruction", "input", "output")
+
+
+@dataclass
+class TrainingRecord:
+    prompt: str
+    response: str
+    source_file: str
+    line_number: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "prompt": self.prompt,
+            "response": self.response,
+            "source_file": self.source_file,
+            "line_number": self.line_number,
+        }
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+def resolve_model_name_or_path(model_name_or_path: str) -> str:
+    if model_name_or_path == DEFAULT_MODEL_ALIAS:
+        if not os.path.exists(DEFAULT_LOCAL_MODEL_PATH):
+            raise FileNotFoundError(
+                f"Default local model path does not exist: {DEFAULT_LOCAL_MODEL_PATH}"
+            )
+        LOGGER.info(
+            "Resolved default model alias %s to local path %s",
+            DEFAULT_MODEL_ALIAS,
+            DEFAULT_LOCAL_MODEL_PATH,
+        )
+        return DEFAULT_LOCAL_MODEL_PATH
+
+    LOGGER.info(
+        "Using explicit model path or cache identifier: %s (local_files_only=True)",
+        model_name_or_path,
+    )
+    return model_name_or_path
+
+
+def discover_training_files(data_dir: str) -> list[str]:
+    pattern = os.path.join(data_dir, "training_sft_data_*.jsonl")
+    files = sorted(
+        path
+        for path in glob(pattern)
+        if os.path.basename(path) != "dataset_stats.json"
+    )
+    if not files:
+        raise FileNotFoundError(
+            f"No training files matching training_sft_data_*.jsonl were found in {data_dir}"
+        )
+    LOGGER.info("Discovered %d training file(s) under %s", len(files), data_dir)
+    for path in files:
+        LOGGER.info("Training data file: %s", path)
+    return files
+
+
+def _normalize_output_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return json.dumps(value, ensure_ascii=False)
+
+
+def load_sft_records(data_dir: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for file_path in discover_training_files(data_dir):
+        with open(file_path, "r", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                stripped_line = raw_line.strip()
+                if not stripped_line:
+                    continue
+
+                try:
+                    payload = json.loads(stripped_line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid JSON in {file_path}:{line_number}: {exc}"
+                    ) from exc
+
+                missing_fields = [
+                    field_name for field_name in REQUIRED_FIELDS if field_name not in payload
+                ]
+                if missing_fields:
+                    raise ValueError(
+                        f"Missing field(s) {missing_fields} in {file_path}:{line_number}"
+                    )
+
+                instruction = str(payload["instruction"]).strip()
+                input_text = str(payload["input"]).strip()
+                output_text = _normalize_output_text(payload["output"])
+
+                if not instruction or not input_text or not output_text:
+                    LOGGER.warning(
+                        "Skipping empty record from %s:%d",
+                        file_path,
+                        line_number,
+                    )
+                    continue
+
+                record = TrainingRecord(
+                    prompt=f"{instruction}\n\n{input_text}",
+                    response=output_text,
+                    source_file=file_path,
+                    line_number=line_number,
+                )
+                records.append(record.to_dict())
+
+    if not records:
+        raise ValueError(f"No usable SFT records were loaded from {data_dir}")
+
+    LOGGER.info("Loaded %d usable SFT record(s)", len(records))
+    return records
+
+
+def _compute_split_counts(total_size: int) -> tuple[int, int, int]:
+    if total_size < 3:
+        raise ValueError(
+            f"At least 3 records are required for an 8:1:1 split, but got {total_size}"
+        )
+
+    target = np.array([0.8, 0.1, 0.1], dtype=float) * float(total_size)
+    counts = np.floor(target).astype(int)
+    remainders = target - counts
+
+    while int(counts.sum()) < total_size:
+        index = int(np.argmax(remainders))
+        counts[index] += 1
+        remainders[index] = -1.0
+
+    for index in range(3):
+        if counts[index] > 0:
+            continue
+        donor_index = int(np.argmax(counts))
+        if counts[donor_index] <= 1:
+            raise ValueError(
+                f"Unable to allocate a non-empty split for {total_size} record(s)"
+            )
+        counts[donor_index] -= 1
+        counts[index] += 1
+
+    train_count, val_count, test_count = (int(value) for value in counts.tolist())
+    return train_count, val_count, test_count
+
+
+def build_dataset_dict(records: list[dict[str, Any]], random_seed: int = 42) -> DatasetDict:
+    if not records:
+        raise ValueError("Cannot build DatasetDict from an empty record list")
+
+    train_count, val_count, test_count = _compute_split_counts(len(records))
+    indices = np.random.default_rng(random_seed).permutation(len(records))
+    shuffled_records = [records[int(index)] for index in indices]
+
+    train_records = shuffled_records[:train_count]
+    val_records = shuffled_records[train_count:train_count + val_count]
+    test_records = shuffled_records[train_count + val_count:]
+
+    if len(test_records) != test_count:
+        raise RuntimeError(
+            f"Unexpected test split size: expected {test_count}, got {len(test_records)}"
+        )
+
+    LOGGER.info(
+        "Dataset split sizes -> train: %d, val: %d, test: %d",
+        len(train_records),
+        len(val_records),
+        len(test_records),
+    )
+
+    return DatasetDict(
+        {
+            "train": Dataset.from_list(train_records),
+            "val": Dataset.from_list(val_records),
+            "test": Dataset.from_list(test_records),
+        }
+    )
+
+
+def load_tokenizer(model_name_or_path: str):
+    resolved_model_path = resolve_model_name_or_path(model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        resolved_model_path,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+
+    if tokenizer.eos_token is None or tokenizer.eos_token_id is None:
+        raise ValueError("Tokenizer must provide eos_token and eos_token_id")
+
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "right"
+    return tokenizer
+
+
+def _tokenize_batch(
+    batch: dict[str, list[Any]],
+    tokenizer,
+    max_length: int,
+) -> dict[str, list[list[int]]]:
+    if max_length < 2:
+        raise ValueError(f"max_length must be >= 2, but got {max_length}")
+
+    eos_token_id = tokenizer.eos_token_id
+    input_id_batch: list[list[int]] = []
+    attention_mask_batch: list[list[int]] = []
+    label_batch: list[list[int]] = []
+
+    prompt_texts = batch["prompt"]
+    response_texts = batch["response"]
+
+    for prompt_text, response_text in zip(prompt_texts, response_texts):
+        prompt_ids = tokenizer(str(prompt_text), add_special_tokens=False)["input_ids"]
+        response_ids = tokenizer(str(response_text), add_special_tokens=False)["input_ids"]
+
+        max_response_length = max_length - 1
+        if len(response_ids) > max_response_length:
+            response_ids = response_ids[:max_response_length]
+
+        prompt_budget = max_length - len(response_ids) - 1
+        prompt_budget = max(prompt_budget, 0)
+        if len(prompt_ids) > prompt_budget:
+            prompt_ids = prompt_ids[:prompt_budget]
+
+        if not response_ids:
+            continue
+
+        input_ids = prompt_ids + response_ids + [eos_token_id]
+        labels = ([-100] * len(prompt_ids)) + response_ids + [eos_token_id]
+        attention_mask = [1] * len(input_ids)
+
+        if not any(label != -100 for label in labels):
+            continue
+
+        input_id_batch.append(input_ids)
+        attention_mask_batch.append(attention_mask)
+        label_batch.append(labels)
+
+    return {
+        "input_ids": input_id_batch,
+        "attention_mask": attention_mask_batch,
+        "labels": label_batch,
+    }
+
+
+def tokenize_dataset_dict(
+    dataset_dict: DatasetDict,
+    tokenizer,
+    max_length: int,
+) -> DatasetDict:
+    tokenized_splits: dict[str, Dataset] = {}
+
+    for split_name, split_dataset in dataset_dict.items():
+        tokenized_dataset = split_dataset.map(
+            lambda batch: _tokenize_batch(batch, tokenizer=tokenizer, max_length=max_length),
+            batched=True,
+            remove_columns=split_dataset.column_names,
+            desc=f"Tokenizing {split_name} split",
+        )
+        if len(tokenized_dataset) == 0:
+            raise ValueError(f"All samples in split '{split_name}' were filtered out")
+        tokenized_splits[split_name] = tokenized_dataset
+        LOGGER.info("Tokenized split '%s' -> %d sample(s)", split_name, len(tokenized_dataset))
+
+    return DatasetDict(tokenized_splits)
+
+
+def load_model_with_lora(model_name_or_path: str, lora_r: int):
+    resolved_model_path = resolve_model_name_or_path(model_name_or_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        resolved_model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    model.config.use_cache = False
+    model.enable_input_require_grads()
+
+    lora_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+    )
+    model = get_peft_model(model, lora_config)
+
+    trainable_parameters = 0
+    total_parameters = 0
+    for parameter in model.parameters():
+        parameter_count = parameter.numel()
+        total_parameters += parameter_count
+        if parameter.requires_grad:
+            trainable_parameters += parameter_count
+
+    LOGGER.info(
+        "Loaded model with LoRA. Trainable parameters: %d / %d (%.4f%%)",
+        trainable_parameters,
+        total_parameters,
+        (trainable_parameters / total_parameters) * 100.0,
+    )
+    return model
+
+
+def build_training_arguments(
+    output_dir: str,
+    num_train_epochs: int,
+    per_device_train_batch_size: int,
+    learning_rate: float,
+    seed: int,
+) -> TrainingArguments:
+    training_kwargs: dict[str, Any] = {
+        "output_dir": output_dir,
+        "num_train_epochs": num_train_epochs,
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "per_device_eval_batch_size": per_device_train_batch_size,
+        "gradient_accumulation_steps": 8,
+        "learning_rate": learning_rate,
+        "lr_scheduler_type": "cosine",
+        "warmup_ratio": 0.05,
+        "bf16": True,
+        "fp16": False,
+        "logging_steps": 10,
+        "save_strategy": "epoch",
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_loss",
+        "greater_is_better": False,
+        "save_total_limit": 2,
+        "dataloader_num_workers": 0,
+        "remove_unused_columns": False,
+        "seed": seed,
+        "report_to": [],
+    }
+
+    signature = inspect.signature(TrainingArguments.__init__)
+    if "evaluation_strategy" in signature.parameters:
+        training_kwargs["evaluation_strategy"] = "epoch"
+    else:
+        training_kwargs["eval_strategy"] = "epoch"
+
+    return TrainingArguments(**training_kwargs)
 
 
 class SurrogateModelTrainer:
-    """
-    代理模型训练器类
-    
-    职责：
-        1. 准备训练数据（从离线采样数据中提取）
-        2. 加载预训练模型
-        3. 执行参数高效微调（LoRA）
-        4. 验证模型性能
-        5. 保存训练结果
-    
-    属性：
-        database (str): 数据库名称（如'tpch', 'tpcc'）
-        model_name (str): 预训练模型名称
-        lora_rank (int): LoRA秩维度
-        learning_rate (float): 学习率
-    """
-    
-    def __init__(self, database, model_name='Qwen/Qwen2.5-7B', 
-                 lora_rank=64, learning_rate=1e-4):
-        """
-        初始化代理模型训练器
-        
-        参数：
-            database (str): 数据库类型标识
-            model_name (str): Hugging Face模型ID，默认为Qwen2.5-7B
-            lora_rank (int): LoRA秩（更大的秩=更多参数，但更多显存占用）
-            learning_rate (float): 微调学习率
-        """
+    def __init__(
+        self,
+        database: str,
+        model_name_or_path: str = DEFAULT_MODEL_ALIAS,
+        data_dir: str = "training_data",
+        output_dir: str = "surrogate/checkpoints",
+        num_train_epochs: int = 3,
+        per_device_train_batch_size: int = 2,
+        max_length: int = 2048,
+        random_seed: int = 42,
+        learning_rate: float = 2e-4,
+        lora_r: int = 16,
+    ) -> None:
         self.database = database
-        self.model_name = model_name
-        self.lora_rank = lora_rank
+        self.model_name_or_path = model_name_or_path
+        self.data_dir = data_dir
+        self.output_dir = os.path.join(output_dir, database)
+        self.num_train_epochs = num_train_epochs
+        self.per_device_train_batch_size = per_device_train_batch_size
+        self.max_length = max_length
+        self.random_seed = random_seed
         self.learning_rate = learning_rate
-        
-        # 日志配置
-        self.logger = self._setup_logger()
-        self.logger.info(f"初始化代理模型训练器: {database}")
-        self.logger.info(f"模型: {model_name}, LoRA Rank: {lora_rank}")
-    
-    def _setup_logger(self):
-        """
-        设置日志记录器
-        
-        返回：
-            logger: 配置好的日志对象
-        """
-        log_dir = './logs/surrogate'
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-        
-        logger = logging.getLogger(f'SurrogateTrainer_{self.database}')
-        logger.setLevel(logging.INFO)
-        
-        # 避免重复添加handler
-        if not logger.handlers:
-            handler = logging.FileHandler(
-                os.path.join(log_dir, f'surrogate_train_{self.database}.log')
-            )
-            formatter = logging.Formatter(
-                '[%(asctime)s - %(levelname)s] %(message)s'
-            )
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-        
-        return logger
-    
-    def prepare_training_data(self, offline_sample_path=None):
-        """
-        准备训练数据
-        
-        从离线采样结果中提取工作负载特征和对应的参数配置。
-        训练数据格式为JSONL，每行包含：
-        {
-            'workload': str,           # 工作负载标识
-            'features': dict,          # 工作负载特征向量
-            'config': dict,            # 参数配置
-            'performance': float       # 性能指标（如TPS）
-        }
-        
-        参数：
-            offline_sample_path (str): 离线采样数据路径
-        
-        返回：
-            list: 经过验证和清洗的训练样本列表
-        """
-        self.logger.info("开始准备训练数据...")
-        
-        if offline_sample_path is None:
-            offline_sample_path = f'offline_sample/offline_sample_{self.database}.jsonl'
-        
-        if not os.path.exists(offline_sample_path):
-            self.logger.error(f"离线采样文件不存在: {offline_sample_path}")
-            raise FileNotFoundError(f"Cannot find {offline_sample_path}")
-        
-        training_data = []
-        sample_count = 0
-        error_count = 0
-        
-        try:
-            import jsonlines
-            with jsonlines.open(offline_sample_path) as f:
-                for line in f:
-                    try:
-                        sample_count += 1
-                        # 验证必需字段
-                        required_fields = ['workload', 'config', 'tps']
-                        if all(field in line for field in required_fields):
-                            training_data.append({
-                                'workload': line['workload'],
-                                'config': line['config'],
-                                'performance': line['tps'],
-                                'inner_metrics': line.get('inner_metrics', {})
-                            })
-                        else:
-                            error_count += 1
-                    except Exception as e:
-                        self.logger.warning(f"处理样本时出错: {e}")
-                        error_count += 1
-        
-        except ImportError:
-            self.logger.error("需要安装jsonlines库: pip install jsonlines")
-            raise
-        
-        self.logger.info(f"数据准备完成: 总样本数={sample_count}, 有效样本数={len(training_data)}, 错误={error_count}")
-        
-        if len(training_data) == 0:
-            self.logger.warning("警告：没有有效的训练样本")
-        
-        return training_data
-    
-    def load_pretrained_model(self):
-        """
-        加载预训练大语言模型
-        
-        使用Hugging Face transformers库加载预训练模型。
-        支持自动分片以适应显存限制。
-        
-        返回：
-            model: 加载的语言模型
-            tokenizer: 对应的分词器
-        """
-        self.logger.info(f"加载预训练模型: {self.model_name}")
-        
-        try:
-            from transformers import AutoTokenizer, AutoModelForCausalLM
-        except ImportError:
-            self.logger.error("需要安装transformers库: pip install transformers torch")
-            raise
-        
-        try:
-            # 加载分词器
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.model_name,
-                trust_remote_code=True  # 某些模型需要此权限
-            )
-            
-            # 加载模型（使用device_map进行自动分片）
-            self.logger.info("加载模型权重...")
-            model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                device_map='auto',      # 自动分配到可用设备
-                torch_dtype='auto',     # 自动选择精度
-                trust_remote_code=True
-            )
-            
-            self.logger.info(f"模型加载成功: {model.config.model_type}")
-            return model, tokenizer
-            
-        except Exception as e:
-            self.logger.error(f"模型加载失败: {e}")
-            raise
-    
-    def apply_lora_adapter(self, model):
-        """
-        应用LoRA适配器进行参数高效微调
-        
-        LoRA的核心思想：
-            - 冻结预训练模型的主体参数
-            - 在注意力层引入可训练的低秩分解矩阵
-            - 通过仅更新这些小矩阵来适应新任务
-        
-        优势：
-            - 显存占用降低4-8倍
-            - 训练速度加快
-            - 避免灾难性遗忘
-        
-        参数：
-            model: 预训练模型
-        
-        返回：
-            model: 应用LoRA后的模型
-        """
-        self.logger.info("应用LoRA适配器...")
-        
-        try:
-            from peft import get_peft_model, LoraConfig, TaskType
-        except ImportError:
-            self.logger.error("需要安装peft库: pip install peft")
-            raise
-        
-        try:
-            lora_config = LoraConfig(
-                r=self.lora_rank,              # LoRA秩
-                lora_alpha=32,                 # LoRA缩放因子
-                target_modules=['q_proj', 'v_proj'],  # 目标模块（因模型而异）
-                lora_dropout=0.05,             # Dropout概率
-                bias='none',                   # 是否训练偏置
-                task_type=TaskType.CAUSAL_LM   # 任务类型
-            )
-            
-            # 创建PEFT模型
-            model = get_peft_model(model, lora_config)
-            
-            # 打印可训练参数统计
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in model.parameters())
-            
-            self.logger.info(f"LoRA适配器应用成功")
-            self.logger.info(f"可训练参数: {trainable_params:,} / 总参数: {total_params:,} "
-                           f"({100*trainable_params/total_params:.2f}%)")
-            
-            return model
-            
-        except Exception as e:
-            self.logger.error(f"LoRA适配器应用失败: {e}")
-            raise
-    
-    def finetune_model(self, model, tokenizer, training_data, num_epochs=3):
-        """
-        微调模型
-        
-        使用Hugging Face Trainer进行分布式微调，支持多GPU加速。
-        
-        参数：
-            model: 应用LoRA的模型
-            tokenizer: 分词器
-            training_data (list): 训练样本列表
-            num_epochs (int): 训练轮数
-        
-        返回：
-            model: 微调后的模型
-        """
-        self.logger.info(f"开始模型微调，轮数={num_epochs}")
-        
-        # 这里是简化的微调流程
-        # 实际应用需要使用Trainer类、数据加载器等完整流程
-        
-        try:
-            from transformers import Trainer, TrainingArguments
-        except ImportError:
-            self.logger.error("需要安装transformers库")
-            raise
-        
-        if len(training_data) == 0:
-            self.logger.warning("训练数据为空，跳过微调")
-            return model
-        
-        try:
-            # 配置训练参数
-            training_args = TrainingArguments(
-                output_dir=f'./surrogate/checkpoints/{self.database}',
-                num_train_epochs=num_epochs,
-                per_device_train_batch_size=4,  # 根据显存调整
-                learning_rate=self.learning_rate,
-                warmup_steps=100,
-                weight_decay=0.01,
-                logging_dir=f'./logs/surrogate/{self.database}',
-                logging_steps=10,
-                save_steps=100,
-                save_total_limit=3,
-                fp16=True,  # 启用混合精度训练
-            )
-            
-            # 创建Trainer（需要实现Dataset类）
-            trainer = Trainer(
-                model=model,
-                args=training_args,
-                # train_dataset=train_dataset,  # 需要实现
-                # callbacks=callbacks  # 可选
-            )
-            
-            self.logger.info("微调过程中... (此处省略实际训练代码)")
-            # trainer.train()
-            
-            self.logger.info("模型微调完成")
-            return model
-            
-        except Exception as e:
-            self.logger.error(f"模型微调失败: {e}")
-            raise
-    
-    def validate_model(self, model, validation_data):
-        """
-        验证模型性能
-        
-        参数：
-            model: 微调后的模型
-            validation_data (list): 验证集
-        
-        返回：
-            dict: 验证指标（如准确率、BLEU分数等）
-        """
-        self.logger.info("开始模型验证...")
-        
-        if len(validation_data) == 0:
-            self.logger.warning("验证集为空")
-            return {}
-        
-        # 简化的验证逻辑
-        metrics = {
-            'validation_samples': len(validation_data),
-            'avg_performance_improvement': 0.0,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        self.logger.info(f"验证完成: {metrics}")
-        return metrics
-    
-    def save_model(self, model, save_path=None):
-        """
-        保存微调后的模型和配置
-        
-        参数：
-            model: 微调后的模型
-            save_path (str): 保存路径，默认为surrogate/{database}.pkl
-        
-        返回：
-            str: 实际保存路径
-        """
-        if save_path is None:
-            save_path = f'surrogate/{self.database}.pkl'
-        
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        
-        self.logger.info(f"保存模型到: {save_path}")
-        
-        try:
-            # 保存模型配置和LoRA权重
-            save_data = {
-                'model_name': self.model_name,
-                'lora_rank': self.lora_rank,
-                'learning_rate': self.learning_rate,
-                'database': self.database,
-                'timestamp': datetime.now().isoformat(),
-                # model权重通常通过save_pretrained()保存
-            }
-            
-            with open(save_path, 'wb') as f:
-                pickle.dump(save_data, f)
-            
-            self.logger.info(f"模型保存成功")
-            return save_path
-            
-        except Exception as e:
-            self.logger.error(f"模型保存失败: {e}")
-            raise
-    
-    def train(self, num_epochs=3):
-        """
-        执行完整的训练流程
-        
-        工作流程：
-            1. 准备训练数据
-            2. 加载预训练模型
-            3. 应用LoRA适配器
-            4. 执行微调
-            5. 验证模型
-            6. 保存模型
-        
-        参数：
-            num_epochs (int): 训练轮数
-        """
-        try:
-            self.logger.info(f"===== 开始训练代理模型: {self.database} =====")
-            
-            # 1. 准备数据
-            training_data = self.prepare_training_data()
-            
-            if len(training_data) == 0:
-                self.logger.info("训练数据不足，跳过微调")
-                return
-            
-            # 分割训练集和验证集
-            split_idx = int(0.8 * len(training_data))
-            train_set = training_data[:split_idx]
-            val_set = training_data[split_idx:]
-            
-            self.logger.info(f"数据分割: 训练集={len(train_set)}, 验证集={len(val_set)}")
-            
-            # 2. 加载预训练模型
-            # model, tokenizer = self.load_pretrained_model()
-            # 注：实际使用需取消注释上行，这里为了演示简化了
-            self.logger.info(f"模型加载步骤已简化（演示版本）")
-            
-            # 3. 应用LoRA
-            # model = self.apply_lora_adapter(model)
-            
-            # 4. 微调
-            # model = self.finetune_model(model, tokenizer, train_set, num_epochs)
-            
-            # 5. 验证
-            # metrics = self.validate_model(model, val_set)
-            
-            # 6. 保存
-            self.logger.info(f"模型准备就绪，保存结果...")
-            # save_path = self.save_model(model)
-            save_path = self.save_model(None)
-            
-            self.logger.info(f"===== 代理模型训练完成: {self.database} =====\n")
-            
-        except Exception as e:
-            self.logger.error(f"训练失败: {e}", exc_info=True)
-            raise
+        self.lora_r = lora_r
 
+    def train(self) -> str:
+        set_seed(self.random_seed)
+        os.makedirs(self.output_dir, exist_ok=True)
 
-def train_surrogate(database):
-    """
-    训练代理模型的主函数入口
-    
-    这是main.py中调用的函数：train_surrogate(cmd.database)
-    
-    参数：
-        database (str): 数据库类型标识（如'tpch', 'tpcc'）
-    
-    用途：
-        在初始离线采样完成后，训练一个生成式大模型来快速推荐参数，
-        避免后续每个工作负载都需要多轮评估。
-    """
-    print(f"\n{'='*60}")
-    print(f"开始训练 {database} 数据库的代理模型...")
-    print(f"{'='*60}\n")
-    
-    try:
-        # 创建训练器实例
-        trainer = SurrogateModelTrainer(
-            database=database,
-            model_name='Qwen/Qwen2.5-7B',  # 可根据需要调整
-            lora_rank=64,                  # 可根据显存调整
-            learning_rate=1e-4
+        records = load_sft_records(self.data_dir)
+        dataset_dict = build_dataset_dict(records, random_seed=self.random_seed)
+        tokenizer = load_tokenizer(self.model_name_or_path)
+        tokenized_dataset_dict = tokenize_dataset_dict(
+            dataset_dict,
+            tokenizer=tokenizer,
+            max_length=self.max_length,
         )
-        
-        # 执行训练
-        trainer.train(num_epochs=3)
-        
-        print(f"\n{'='*60}")
-        print(f"代理模型训练完成！")
-        print(f"模型已保存到: surrogate/{database}.pkl")
-        print(f"{'='*60}\n")
-        
-    except Exception as e:
-        print(f"\n{'='*60}")
-        print(f"代理模型训练失败: {e}")
-        print(f"{'='*60}\n")
-        raise
+        model = load_model_with_lora(
+            self.model_name_or_path,
+            lora_r=self.lora_r,
+        )
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            model=model,
+            padding=True,
+            label_pad_token_id=-100,
+        )
+        training_args = build_training_arguments(
+            output_dir=self.output_dir,
+            num_train_epochs=self.num_train_epochs,
+            per_device_train_batch_size=self.per_device_train_batch_size,
+            learning_rate=self.learning_rate,
+            seed=self.random_seed,
+        )
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_dataset_dict["train"],
+            eval_dataset=tokenized_dataset_dict["val"],
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+        )
+
+        LOGGER.info("Starting Qwen2.5 + LoRA SFT training")
+        train_result = trainer.train()
+        LOGGER.info("Training metrics: %s", train_result.metrics)
+
+        test_metrics = trainer.evaluate(
+            eval_dataset=tokenized_dataset_dict["test"],
+            metric_key_prefix="test",
+        )
+        LOGGER.info("Test metrics: %s", test_metrics)
+
+        trainer.model.save_pretrained(self.output_dir)
+        tokenizer.save_pretrained(self.output_dir)
+        trainer.save_state()
+        LOGGER.info("Saved LoRA adapter and tokenizer to %s", self.output_dir)
+        return self.output_dir
+
+
+def train_surrogate(database: str) -> str:
+    trainer = SurrogateModelTrainer(database=database)
+    return trainer.train()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train Qwen2.5 with LoRA on SFT tuning data")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL_ALIAS,
+        help=(
+            "Model path or HuggingFace ID. "
+            f"The default alias is always resolved to the local path {DEFAULT_LOCAL_MODEL_PATH}."
+        ),
+    )
+    parser.add_argument(
+        "--database",
+        type=str,
+        default="tpch",
+        help="Used for naming the checkpoint directory",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="training_data",
+        help="Directory containing training_sft_data_*.jsonl files",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="surrogate/checkpoints",
+        help="Checkpoint output root directory",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+        help="Number of training epochs",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+        help="Per-device train and eval batch size",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=2048,
+        help="Maximum sequence length after tokenization",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used for shuffling and training",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=2e-4,
+        help="Learning rate",
+    )
+    parser.add_argument(
+        "--lora-r",
+        type=int,
+        default=16,
+        help="LoRA rank",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    configure_logging()
+    args = parse_args()
+    trainer = SurrogateModelTrainer(
+        database=args.database,
+        model_name_or_path=args.model,
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        max_length=args.max_length,
+        random_seed=args.seed,
+        learning_rate=args.lr,
+        lora_r=args.lora_r,
+    )
+    final_output_dir = trainer.train()
+    LOGGER.info("Training completed successfully. Output directory: %s", final_output_dir)
+
+
+if __name__ == "__main__":
+    main()
