@@ -30,7 +30,7 @@ from transformers import set_seed
 
 LOGGER = logging.getLogger("surrogate.train_surrogate")
 DEFAULT_MODEL_ALIAS = "Qwen/Qwen2.5-7B-Instruct"
-DEFAULT_LOCAL_MODEL_PATH = "/root/data/models/Qwen2.5-7B-Instruct"
+DEFAULT_LOCAL_MODEL_PATH = "/root/llm/data/models/Qwen2.5-7B-Instruct"
 REQUIRED_FIELDS = ("instruction", "input", "output")
 
 
