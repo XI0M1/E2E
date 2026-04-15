@@ -168,9 +168,11 @@ def _run_explain(conn, sql: str, timeout_ms: int) -> tuple[Optional[dict], Optio
             cur.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
             cur.execute(f"EXPLAIN (FORMAT JSON) {sql}")
             row = cur.fetchone()
-            if not row:
-                return None, "EXPLAIN returned no rows"
-            plan_json = json.loads(row[0])
+            raw = row[0]
+            if isinstance(raw, str):
+                plan_json = json.loads(raw)
+            else:
+                plan_json = raw  # already a Python list decoded by psycopg2
             root_node = plan_json[0]["Plan"]
             return root_node, None
     except Exception as exc:
