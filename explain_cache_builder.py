@@ -13,7 +13,7 @@ python explain_cache_builder.py \\
     --host 127.0.0.1 \\
     --port 5432 \\
     --username dbuser \\
-    --password 7684105 \\
+    --password YOUR_PASSWORD \\
     --config config/cloud.ini \\
     --output-dir explain_cache \\
     --max-sqls-per-workload 5 \\
@@ -36,6 +36,9 @@ import psycopg2
 
 from plan_feature_extractor import extract_plan_summary, parse_plan_node
 
+
+# Maximum characters to store for SQL text in plan entries
+_SQL_TEXT_MAX_CHARS = 200
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -241,7 +244,7 @@ def _process_workload(
             plans.append(
                 {
                     "sql_index": i,
-                    "sql_text": sql[:200],
+                    "sql_text": sql[:_SQL_TEXT_MAX_CHARS],
                     "error": err or "No root node",
                     "plan_summary": None,
                     "plan_nodes": [],
@@ -255,7 +258,7 @@ def _process_workload(
         plans.append(
             {
                 "sql_index": i,
-                "sql_text": sql[:200],
+                "sql_text": sql[:_SQL_TEXT_MAX_CHARS],
                 "error": None,
                 "plan_summary": plan_summary,
                 "plan_nodes": plan_nodes,

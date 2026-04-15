@@ -798,12 +798,13 @@ class TrainingDataBuilder:
                 # Resolve workload_id for explain cache lookup
                 _wk_full = str(sample.get("workload") or "")
                 _wk_base = str(sample.get("workload_file") or "")
+                # Pre-compute path components once for use in both id derivation and lookup
+                _wk_full_bn = os.path.basename(_wk_full) if _wk_full else ""
+                _wk_base_bn = os.path.basename(_wk_base) if _wk_base else ""
+                _wk_full_stem = os.path.splitext(_wk_full_bn)[0]
+                _wk_base_stem = os.path.splitext(_wk_base_bn)[0]
                 # Try stem of full path first, then stem of basename
-                _workload_id = (
-                    os.path.splitext(os.path.basename(_wk_full))[0]
-                    or os.path.splitext(_wk_base)[0]
-                    or ""
-                )
+                _workload_id = _wk_full_stem or _wk_base_stem or ""
 
                 # Priority 1: explain cache (structured, compact)
                 explain_plans = self._load_explain_cache(_workload_id) if _workload_id else []
@@ -819,8 +820,8 @@ class TrainingDataBuilder:
                         _wk_lookup_keys = list(filter(None, [
                             _wk_full,
                             _wk_base,
-                            os.path.basename(_wk_full),
-                            os.path.basename(_wk_base),
+                            _wk_full_bn,
+                            _wk_base_bn,
                             _workload_id,
                         ]))
                         for _key in _wk_lookup_keys:
