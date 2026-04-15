@@ -92,6 +92,8 @@ class BuilderConfig:
     top_fraction: float = 0.33
     secondary_fraction: float = 0.167
     validate_output_bounds: bool = True  # reject samples whose knob values exceed knob_config bounds
+    explain_cache_dir: str = "explain_cache"   # root dir for explain_cache JSON files
+    max_plan_nodes: int = 12                   # max nodes in compact plan representation
 
 
 @dataclass
@@ -135,6 +137,7 @@ class TrainingDataBuilder:
         self._last_valid_source_samples: list[dict[str, Any]] = []
         self.workload_search_dirs = self._build_workload_search_dirs()
         self._knob_bounds: dict[str, dict[str, float]] = self._load_knob_bounds()
+        self._explain_cache: dict[str, list[dict]] = {}   # workload_id → plans list
 
     def _build_workload_search_dirs(self) -> list[str]:
         """Build workload search directories for both old and new layouts."""
@@ -188,6 +191,34 @@ class TrainingDataBuilder:
         except Exception as exc:
             logger.warning("Failed to load knob bounds: %s; skipping bound validation", exc)
             return {}
+
+    def _load_explain_cache(self, workload_id: str) -> list[dict]:
+        """
+        Load the explain cache for *workload_id* from explain_cache_dir.
+
+        Returns the plans list (possibly empty). Caches results in
+        self._explain_cache to avoid repeated disk reads.
+        """
+        if workload_id in self._explain_cache:
+            return self._explain_cache[workload_id]
+
+        cache_path = os.path.join(
+            self.builder_config.explain_cache_dir,
+            # infer database from the offline_sample_path directory name
+            os.path.basename(os.path.dirname(self.offline_sample_path)),
+            f"{workload_id}.json",
+        )
+        plans: list[dict] = []
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                plans = data.get("plans", [])
+            except Exception as exc:
+                logger.debug("Failed to load explain cache for %s: %s", workload_id, exc)
+
+        self._explain_cache[workload_id] = plans
+        return plans
 
     def resolve_workload_path(self, sample: dict[str, Any]) -> str:
         """Prefer real paths from samples and fall back to name-based search."""
@@ -738,21 +769,70 @@ class TrainingDataBuilder:
         # have query_plans="" because EXPLAIN is only run once per workload.
         workload_plans_cache: dict[str, str] = {}
         for _s in selected_samples:
-            _wk = str(_s.get("workload") or _s.get("workload_file") or "")
+            _wk_full = str(_s.get("workload") or "")
+            _wk_base = str(_s.get("workload_file") or "")
             _qp = str(_s.get("query_plans") or "").strip()
-            if _wk and _qp and _wk not in workload_plans_cache:
-                workload_plans_cache[_wk] = _qp
+            if _qp:
+                # Index by both full path and basename so lookups always hit
+                for _key in filter(None, [
+                    _wk_full,
+                    _wk_base,
+                    os.path.basename(_wk_full) if _wk_full else "",
+                    os.path.basename(_wk_base) if _wk_base else "",
+                    os.path.splitext(os.path.basename(_wk_full))[0] if _wk_full else "",
+                    os.path.splitext(os.path.basename(_wk_base))[0] if _wk_base else "",
+                ]):
+                    if _key and _key not in workload_plans_cache:
+                        workload_plans_cache[_key] = _qp
+
+        try:
+            from plan_feature_extractor import format_plan_compact as _fmt_plan
+        except ImportError:
+            _fmt_plan = None
 
         for index, sample in enumerate(selected_samples, 1):
             try:
                 workload_path = self.resolve_workload_path(sample)
                 workload_stats = self.extract_workload_statistics(workload_path)
-                _raw_plans = str(sample.get("query_plans") or "").strip()
-                if not _raw_plans:
-                    _wk = str(sample.get("workload") or sample.get("workload_file") or "")
-                    _raw_plans = workload_plans_cache.get(_wk, "")
-                query_plans_text = self._select_query_plans_text(_raw_plans)
+
+                # Resolve workload_id for explain cache lookup
+                _wk_full = str(sample.get("workload") or "")
+                _wk_base = str(sample.get("workload_file") or "")
+                # Try stem of full path first, then stem of basename
+                _workload_id = (
+                    os.path.splitext(os.path.basename(_wk_full))[0]
+                    or os.path.splitext(_wk_base)[0]
+                    or ""
+                )
+
+                # Priority 1: explain cache (structured, compact)
+                explain_plans = self._load_explain_cache(_workload_id) if _workload_id else []
+                if explain_plans and _fmt_plan is not None:
+                    query_plans_text = _fmt_plan(
+                        explain_plans,
+                        max_nodes=self.builder_config.max_plan_nodes,
+                    )
+                else:
+                    # Priority 2: raw query_plans from offline_sample (fallback)
+                    _raw_plans = str(sample.get("query_plans") or "").strip()
+                    if not _raw_plans:
+                        _wk_lookup_keys = list(filter(None, [
+                            _wk_full,
+                            _wk_base,
+                            os.path.basename(_wk_full),
+                            os.path.basename(_wk_base),
+                            _workload_id,
+                        ]))
+                        for _key in _wk_lookup_keys:
+                            _raw_plans = workload_plans_cache.get(_key, "")
+                            if _raw_plans:
+                                break
+                    query_plans_text = self._select_query_plans_text(_raw_plans)
+
                 metrics_text = self.format_metrics_text(sample.get("inner_metrics", {}))
+
+                _avg_lat = sample.get("avg_latency_ms")
+                _avg_lat_str = f"{float(_avg_lat):.1f}" if _avg_lat is not None else "N/A"
 
                 input_text = (
                     "Workload Statistics:\n"
@@ -762,7 +842,8 @@ class TrainingDataBuilder:
                     f"- GROUP BY Proportion: {workload_stats['group_by_percent']}%\n"
                     f"- JOIN Count: {workload_stats['join_count']}\n"
                     f"- Aggregation Functions: {workload_stats['aggregation_count']}\n"
-                    f"- Table Count: {workload_stats['table_count']}\n\n"
+                    f"- Table Count: {workload_stats['table_count']}\n"
+                    f"- Avg Query Latency: {_avg_lat_str}ms\n\n"
                     "Query Plans:\n"
                     f"{query_plans_text}\n\n"
                     "Internal Metrics:\n"
