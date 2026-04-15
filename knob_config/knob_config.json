@@ -1,27 +1,27 @@
 {
   "shared_buffers": {
     "type": "integer",
-    "min": 16,
-    "max": 2359296,
-    "default": 16384,
-    "step": 8,
+    "min": 65536,
+    "max": 1572864,
+    "default": 65536,
+    "step": 1024,
     "unit": "8kB",
     "description": "数据库服务器将用于共享内存缓冲区的内存量(单位:8KB页)",
     "category": "Memory Management"
   },
   "work_mem": {
     "type": "integer",
-    "min": 64,
-    "max": 2359296,
-    "default": 4096,
-    "step": 64,
+    "min": 4096,
+    "max": 262144,
+    "default": 9216,
+    "step": 1024,
     "description": "排序操作和哈希表在开始使用磁盘前可用的最大内存(KB)",
     "category": "Memory Management"
   },
   "maintenance_work_mem": {
     "type": "integer",
-    "min": 64,
-    "max": 2359296,
+    "min": 65536,
+    "max": 2097152,
     "default": 65536,
     "step": 1024,
     "description": "VACUUM、ANALYZE等维护操作可用的内存量(KB)",
@@ -30,7 +30,7 @@
   "temp_buffers": {
     "type": "integer",
     "min": 100,
-    "max": 2359296,
+    "max": 65536,
     "default": 1024,
     "step": 100,
     "unit": "8kB",
@@ -39,10 +39,10 @@
   },
   "effective_cache_size": {
     "type": "integer",
-    "min": 1,
+    "min": 131072,
     "max": 2359296,
     "default": 524288,
-    "step": 1,
+    "step": 1024,
     "unit": "8kB",
     "description": "查询规划器假定有多少内存可用于磁盘缓存(8KB页)",
     "category": "Memory Management"
@@ -50,7 +50,7 @@
   "wal_buffers": {
     "type": "integer",
     "min": -1,
-    "max": 262143,
+    "max": 16384,
     "default": 16,
     "step": 1,
     "unit": "8kB",
@@ -69,8 +69,8 @@
   "max_wal_senders": {
     "type": "integer",
     "min": 0,
-    "max": 262413,
-    "default": 10,
+    "max": 10,
+    "default": 5,
     "step": 1,
     "description": "可连接的最大流复制客户端数",
     "category": "WAL & Checkpointing"
@@ -78,16 +78,16 @@
   "checkpoint_timeout": {
     "type": "integer",
     "min": 30,
-    "max": 86400,
+    "max": 3600,
     "default": 300,
-    "step": 1,
+    "step": 60,
     "description": "检查点之间的时间间隔(秒)",
     "category": "WAL & Checkpointing"
   },
   "checkpoint_completion_target": {
     "type": "float",
-    "min": 0.0,
-    "max": 1.0,
+    "min": 0.1,
+    "max": 0.95,
     "default": 0.5,
     "step": 0.01,
     "description": "检查点完成时间与间隔时间的比例(0.5=50%)",
@@ -114,7 +114,7 @@
   "autovacuum_max_workers": {
     "type": "integer",
     "min": 1,
-    "max": 262143,
+    "max": 8,
     "default": 3,
     "step": 1,
     "description": "并发autovacuum进程的最大数量",
@@ -123,7 +123,7 @@
   "autovacuum_naptime": {
     "type": "integer",
     "min": 1,
-    "max": 2147483,
+    "max": 3600,
     "default": 60,
     "step": 1,
     "description": "autovacuum检查间隔(秒)",
@@ -132,7 +132,7 @@
   "autovacuum_vacuum_threshold": {
     "type": "integer",
     "min": 0,
-    "max": 2147483647,
+    "max": 10000,
     "default": 50,
     "step": 1,
     "description": "触发autovacuum的最小死元组个数",
@@ -141,7 +141,7 @@
   "autovacuum_analyze_threshold": {
     "type": "integer",
     "min": 0,
-    "max": 2147483647,
+    "max": 10000,
     "default": 50,
     "step": 1,
     "description": "触发autovacuum分析的最小修改行数",
@@ -150,7 +150,7 @@
   "autovacuum_vacuum_scale_factor": {
     "type": "float",
     "min": 0.0,
-    "max": 100.0,
+    "max": 1.0,
     "default": 0.2,
     "step": 0.01,
     "description": "autovacuum触发的表大小百分比",
@@ -159,7 +159,7 @@
   "autovacuum_analyze_scale_factor": {
     "type": "float",
     "min": 0.0,
-    "max": 100.0,
+    "max": 1.0,
     "default": 0.1,
     "step": 0.01,
     "description": "autovacuum分析触发的表大小百分比",
@@ -239,8 +239,8 @@
   },
   "effective_io_concurrency": {
     "type": "integer",
-    "min": 0,
-    "max": 1000,
+    "min": 1,
+    "max": 256,
     "default": 6,
     "step": 1,
     "description": "数据库假设可以并行执行的磁盘I/O操作数",
@@ -248,8 +248,8 @@
   },
   "cursor_tuple_fraction": {
     "type": "float",
-    "min": 0.0,
-    "max": 1.0,
+    "min": 0.1,
+    "max": 0.95,
     "default": 0.1,
     "step": 0.01,
     "description": "规划器假设游标会获取结果集百分比",
@@ -258,7 +258,7 @@
   "join_collapse_limit": {
     "type": "integer",
     "min": 1,
-    "max": 2147483647,
+    "max": 20,
     "default": 8,
     "step": 1,
     "description": "JOIN重新排序的表数限制,超过此值使用GEQO",
@@ -267,7 +267,7 @@
   "from_collapse_limit": {
     "type": "integer",
     "min": 1,
-    "max": 2147483647,
+    "max": 20,
     "default": 8,
     "step": 1,
     "description": "FROM列表项重排的数量限制",
@@ -276,7 +276,7 @@
   "geqo_threshold": {
     "type": "integer",
     "min": 2,
-    "max": 2147483647,
+    "max": 20,
     "default": 12,
     "step": 1,
     "description": "触发GEQO(遗传查询优化器)的FROM项数",
@@ -294,7 +294,7 @@
   "geqo_pool_size": {
     "type": "integer",
     "min": 0,
-    "max": 2147483647,
+    "max": 1000,
     "default": 0,
     "step": 1,
     "description": "GEQO种群大小,0=自动计算(通常2*geqo_effort)",
@@ -303,7 +303,7 @@
   "geqo_generations": {
     "type": "integer",
     "min": 0,
-    "max": 2147483647,
+    "max": 1000,
     "default": 0,
     "step": 1,
     "description": "GEQO最大代数,0=自动计算(通常geqo_effort)",
@@ -320,10 +320,10 @@
   },
   "max_connections": {
     "type": "integer",
-    "min": 1,
-    "max": 262143,
-    "default": 100,
-    "step": 1,
+    "min": 10,
+    "max": 400,
+    "default": 20,
+    "step": 2,
     "description": "允许的最大并发数据库连接数",
     "category": "Concurrency & Transaction"
   },
@@ -348,7 +348,7 @@
   "deadlock_timeout": {
     "type": "integer",
     "min": 1,
-    "max": 2147483647,
+    "max": 10000,
     "default": 1000,
     "step": 1,
     "description": "声明死锁前等待的毫秒数",
@@ -357,16 +357,16 @@
   "bgwriter_delay": {
     "type": "integer",
     "min": 10,
-    "max": 10000,
+    "max": 5000,
     "default": 200,
-    "step": 1,
+    "step": 10,
     "description": "后台写入器检查脏页的间隔(毫秒)",
     "category": "Concurrency & Transaction"
   },
   "bgwriter_lru_maxpages": {
     "type": "integer",
     "min": 0,
-    "max": 1073741823,
+    "max": 1000,
     "default": 100,
     "step": 1,
     "description": "后台写入器每轮写入的最大页数,0=禁用",
@@ -374,7 +374,7 @@
   },
   "bgwriter_lru_multiplier": {
     "type": "float",
-    "min": 0.0,
+    "min": 1.0,
     "max": 10.0,
     "default": 2.0,
     "step": 0.1,
@@ -394,8 +394,8 @@
     "type": "integer",
     "min": -1,
     "max": 2359296,
-    "default": -1,
-    "step": 1,
+    "default": 1024,
+    "step": 65536,
     "description": "会话可使用的临时文件最大大小(KB),-1=无限制",
     "category": "Concurrency & Transaction"
   }
