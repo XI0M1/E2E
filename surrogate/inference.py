@@ -41,7 +41,7 @@ class InferenceSample:
 
     @property
     def prompt(self) -> str:
-        return f"{self.instruction}\n\n{self.input_text}"
+        return f"{self.instruction}\n\n{self.input_text}\n\nOutput JSON:"
 
 
 @dataclass

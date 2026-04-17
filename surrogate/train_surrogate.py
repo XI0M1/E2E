@@ -137,7 +137,7 @@ def load_sft_records(data_dir: str) -> list[dict[str, Any]]:
                     continue
 
                 record = TrainingRecord(
-                    prompt=f"{instruction}\n\n{input_text}",
+                    prompt=f"{instruction}\n\n{input_text}\n\nOutput JSON:",
                     response=output_text,
                     source_file=file_path,
                     line_number=line_number,
@@ -235,6 +235,7 @@ def _tokenize_batch(
     batch: dict[str, list[Any]],
     tokenizer,
     max_length: int,
+    prompt_floor: int = 200,
 ) -> dict[str, list[list[int]]]:
     if max_length < 2:
         raise ValueError(f"max_length must be >= 2, but got {max_length}")
@@ -251,14 +252,14 @@ def _tokenize_batch(
         prompt_ids = tokenizer(str(prompt_text), add_special_tokens=False)["input_ids"]
         response_ids = tokenizer(str(response_text), add_special_tokens=False)["input_ids"]
 
-        max_response_length = max_length - 1
-        if len(response_ids) > max_response_length:
-            response_ids = response_ids[:max_response_length]
-
-        prompt_budget = max_length - len(response_ids) - 1
+        prompt_budget = max(prompt_floor, max_length - len(response_ids) - 1)
+        prompt_budget = min(prompt_budget, max_length - 2)
         prompt_budget = max(prompt_budget, 0)
-        if len(prompt_ids) > prompt_budget:
-            prompt_ids = prompt_ids[:prompt_budget]
+        prompt_ids = prompt_ids[:prompt_budget]
+
+        response_budget = max_length - min(len(prompt_ids), prompt_budget) - 1
+        response_budget = max(response_budget, 1)
+        response_ids = response_ids[:response_budget]
 
         if not response_ids:
             continue
@@ -285,12 +286,18 @@ def tokenize_dataset_dict(
     dataset_dict: DatasetDict,
     tokenizer,
     max_length: int,
+    prompt_floor: int = 200,
 ) -> DatasetDict:
     tokenized_splits: dict[str, Dataset] = {}
 
     for split_name, split_dataset in dataset_dict.items():
         tokenized_dataset = split_dataset.map(
-            lambda batch: _tokenize_batch(batch, tokenizer=tokenizer, max_length=max_length),
+            lambda batch: _tokenize_batch(
+                batch,
+                tokenizer=tokenizer,
+                max_length=max_length,
+                prompt_floor=prompt_floor,
+            ),
             batched=True,
             remove_columns=split_dataset.column_names,
             desc=f"Tokenizing {split_name} split",
@@ -332,6 +339,7 @@ def load_model_with_lora(model_name_or_path: str, lora_r: int):
         ],
     )
     model = get_peft_model(model, lora_config)
+    model.gradient_checkpointing_enable()
 
     trainable_parameters = 0
     total_parameters = 0
@@ -376,6 +384,8 @@ def build_training_arguments(
         "save_total_limit": 2,
         "dataloader_num_workers": 0,
         "remove_unused_columns": False,
+        "gradient_checkpointing": True,
+        "group_by_length": True,
         "seed": seed,
         "report_to": [],
     }
@@ -399,6 +409,7 @@ class SurrogateModelTrainer:
         num_train_epochs: int = 3,
         per_device_train_batch_size: int = 2,
         max_length: int = 2048,
+        prompt_floor: int = 200,
         random_seed: int = 42,
         learning_rate: float = 2e-4,
         lora_r: int = 16,
@@ -410,6 +421,7 @@ class SurrogateModelTrainer:
         self.num_train_epochs = num_train_epochs
         self.per_device_train_batch_size = per_device_train_batch_size
         self.max_length = max_length
+        self.prompt_floor = prompt_floor
         self.random_seed = random_seed
         self.learning_rate = learning_rate
         self.lora_r = lora_r
@@ -425,6 +437,7 @@ class SurrogateModelTrainer:
             dataset_dict,
             tokenizer=tokenizer,
             max_length=self.max_length,
+            prompt_floor=self.prompt_floor,
         )
         model = load_model_with_lora(
             self.model_name_or_path,
@@ -523,6 +536,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum sequence length after tokenization",
     )
     parser.add_argument(
+        "--prompt-floor",
+        type=int,
+        default=200,
+        help="Minimum guaranteed prompt tokens to preserve after truncation",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -554,6 +573,7 @@ def main() -> None:
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         max_length=args.max_length,
+        prompt_floor=args.prompt_floor,
         random_seed=args.seed,
         learning_rate=args.lr,
         lora_r=args.lora_r,
