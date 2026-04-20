@@ -9,7 +9,9 @@ import argparse
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -18,6 +20,11 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 from transformers import set_seed
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from surrogate.train_surrogate import DEFAULT_MODEL_ALIAS
 from surrogate.train_surrogate import DEFAULT_LOCAL_MODEL_PATH
@@ -458,6 +465,8 @@ def run_inference(
     parse_success = 0
     validation_success = 0
     validation_attempts = 0
+    exact_match = 0
+    exact_match_comparable = 0
 
     try:
         for index, sample in enumerate(samples, start=1):
@@ -559,6 +568,16 @@ def run_inference(
     finally:
         validator_context.close()
 
+    for _r in results:
+        if _r.get("expected_output") and _r.get("parse_ok"):
+            exact_match_comparable += 1
+            try:
+                _expected = json.loads(_r["expected_output"])
+                if isinstance(_expected, dict) and _expected == _r.get("generated_payload"):
+                    exact_match += 1
+            except Exception:
+                pass
+
     save_results_jsonl(output_path, results)
 
     total = len(results)
@@ -575,6 +594,9 @@ def run_inference(
         "validation_attempts": validation_attempts,
         "validation_success": validation_success,
         "validation_success_rate": round(validation_success_rate, 4),
+        "exact_match_comparable": exact_match_comparable,
+        "exact_match": exact_match,
+        "exact_match_rate": round(exact_match / exact_match_comparable, 4) if exact_match_comparable else 0.0,
         "output_path": output_path,
     }
     LOGGER.info("Inference summary: %s", summary)
@@ -637,8 +659,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-length",
         type=int,
-        default=2048,
-        help="Maximum prompt token length during inference",
+        default=768,
+        help=(
+            "Maximum prompt token length during inference. "
+            "Must match the --max-length used during training (default: 768)."
+        ),
     )
     parser.add_argument(
         "--max-new-tokens",

@@ -476,6 +476,11 @@ class SurrogateModelTrainer:
         )
         LOGGER.info("Test metrics: %s", test_metrics)
 
+        _metrics_path = os.path.join(self.output_dir, "test_metrics.json")
+        with open(_metrics_path, "w", encoding="utf-8") as _fh:
+            json.dump(test_metrics, _fh, ensure_ascii=False, indent=2)
+        LOGGER.info("Test metrics saved to %s", _metrics_path)
+
         trainer.model.save_pretrained(self.output_dir)
         tokenizer.save_pretrained(self.output_dir)
         trainer.save_state()
