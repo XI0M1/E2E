@@ -876,6 +876,10 @@ class TrainingDataBuilder:
                         "instruction": instruction,
                         "input": input_text,
                         "output": output_json,
+                        "workload": sample.get("workload"),
+                        "workload_file": sample.get("workload_file"),
+                        "workload_type": sample.get("workload_type"),
+                        "baseline_tps": sample.get("baseline_tps"),
                     }
                 )
                 self._last_valid_source_samples.append(sample)
