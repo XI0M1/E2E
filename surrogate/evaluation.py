@@ -76,6 +76,8 @@ def infer_db_type_from_workload_file(workload_file: str | None) -> str:
     workload_id = normalize_workload_id(workload_file).lower()
     if workload_id.startswith("job_"):
         return "job"
+    if workload_id.startswith("ssb_"):
+        return "ssb"
     if workload_id.startswith("tpch_"):
         return "tpch"
     return ""
@@ -636,7 +638,7 @@ def parse_args() -> argparse.Namespace:
         "--db",
         type=str,
         default=None,
-        choices=["job", "tpch"],
+        choices=["job", "tpch", "ssb"],
         help="Override database name from config.ini for dynamic execution",
     )
     parser.add_argument(
